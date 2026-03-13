@@ -1,0 +1,23 @@
+{
+  "name": "llm-trace",
+  "version": "1.0.0",
+  "description": "Lightweight local tracing for LLM calls",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "commonjs",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "llm",
+    "trace",
+    "dashboard",
+    "local-dev"
+  ],
+  "license": "ISC"
+}
