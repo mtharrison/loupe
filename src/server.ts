@@ -1,20 +1,27 @@
-'use strict';
+import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { URL } from 'node:url';
+import { renderAppHtml } from './ui';
+import { type TraceEvent, type TraceFilters, type TraceServer, type UIReloadEvent } from './types';
+import { TraceStore } from './store';
 
-const http = require('node:http');
-const { URL } = require('node:url');
-const { renderAppHtml } = require('./ui');
-
-function createTraceServer(store, options = {}) {
+export function createTraceServer(store: TraceStore, options: { host?: string; port?: number } = {}): TraceServer {
   const host = options.host || '127.0.0.1';
   const port = Number(options.port) || 4319;
-  const clients = new Set();
+  const clients = new Set<ServerResponse>();
 
-  const server = http.createServer(async (req, res) => {
+  const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      const url = new URL(req.url, `http://${req.headers.host || `${host}:${port}`}`);
+      const url = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`);
 
       if (req.method === 'GET' && url.pathname === '/') {
         sendHtml(res, renderAppHtml());
+        return;
+      }
+
+      if (req.method === 'GET' && url.pathname.startsWith('/assets/')) {
+        await sendAsset(res, url.pathname);
         return;
       }
 
@@ -52,21 +59,18 @@ function createTraceServer(store, options = {}) {
       }
 
       sendJson(res, 404, { error: 'Not found' });
-    } catch (error) {
+    } catch (error: any) {
       sendJson(res, 500, { error: error.message });
     }
   });
 
   store.on('event', (event) => {
-    const payload = `data: ${JSON.stringify(event)}\n\n`;
-    for (const client of clients) {
-      client.write(payload);
-    }
+    broadcast(event);
   });
 
   return {
     async start() {
-      await new Promise((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         server.once('error', reject);
         server.listen(port, host, () => {
           server.removeListener('error', reject);
@@ -82,6 +86,7 @@ function createTraceServer(store, options = {}) {
         url: `http://${host}:${port}`,
       };
     },
+    broadcast,
     close() {
       for (const client of clients) {
         client.end();
@@ -90,9 +95,16 @@ function createTraceServer(store, options = {}) {
       server.close();
     },
   };
+
+  function broadcast(event: TraceEvent | UIReloadEvent) {
+    const payload = `data: ${JSON.stringify(event)}\n\n`;
+    for (const client of clients) {
+      client.write(payload);
+    }
+  }
 }
 
-function parseFilters(url) {
+function parseFilters(url: URL): TraceFilters {
   return {
     search: url.searchParams.get('search') || undefined,
     status: url.searchParams.get('status') || undefined,
@@ -104,7 +116,7 @@ function parseFilters(url) {
   };
 }
 
-function sendHtml(res, body) {
+function sendHtml(res: ServerResponse, body: string) {
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -112,7 +124,7 @@ function sendHtml(res, body) {
   res.end(body);
 }
 
-function sendJson(res, statusCode, body) {
+function sendJson(res: ServerResponse, statusCode: number, body: unknown) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -120,7 +132,7 @@ function sendJson(res, statusCode, body) {
   res.end(JSON.stringify(body));
 }
 
-function openSse(res, clients) {
+function openSse(res: ServerResponse, clients: Set<ServerResponse>) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -131,6 +143,34 @@ function openSse(res, clients) {
   res.on('close', () => clients.delete(res));
 }
 
-module.exports = {
-  createTraceServer,
-};
+async function sendAsset(res: ServerResponse, pathname: string) {
+  const assetName = pathname.replace(/^\/assets\//, '');
+  const filePath = path.join(__dirname, 'client', assetName);
+
+  try {
+    const body = await readFile(filePath);
+    res.writeHead(200, {
+      'Content-Type': getContentType(filePath),
+      'Cache-Control': 'no-store',
+    });
+    res.end(body);
+  } catch {
+    sendJson(res, 404, { error: 'Asset not found' });
+  }
+}
+
+function getContentType(filePath: string): string {
+  if (filePath.endsWith('.css')) {
+    return 'text/css; charset=utf-8';
+  }
+
+  if (filePath.endsWith('.js')) {
+    return 'application/javascript; charset=utf-8';
+  }
+
+  if (filePath.endsWith('.svg')) {
+    return 'image/svg+xml';
+  }
+
+  return 'application/octet-stream';
+}

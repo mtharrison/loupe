@@ -1,23 +1,71 @@
 {
-  "name": "llm-trace",
+  "name": "@mtharrison/loupe",
   "version": "1.0.0",
-  "description": "Lightweight local tracing for LLM calls",
-  "main": "index.js",
-  "types": "index.d.ts",
+  "description": "Lightweight local tracing dashboard for LLM calls",
+  "author": "Matt Harrison",
+  "license": "MIT",
   "type": "commonjs",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
-    "index.js",
-    "index.d.ts",
-    "lib"
+    "dist",
+    "assets",
+    "README.md",
+    "LICENSE"
   ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "test": "node --test"
+    "build": "tsc -p tsconfig.json && node scripts/build-ui.mjs",
+    "release": "npx semantic-release",
+    "test": "npm run build && node --test"
+  },
+  "release": {
+    "branches": [
+      "master"
+    ],
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.2"
   },
   "keywords": [
     "llm",
+    "observability",
+    "openai",
+    "tracing",
     "trace",
     "dashboard",
     "local-dev"
   ],
-  "license": "ISC"
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "esbuild": "^0.27.4",
+    "lucide-react": "^0.577.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  }
 }

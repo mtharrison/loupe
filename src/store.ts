@@ -1,21 +1,38 @@
-'use strict';
+import { EventEmitter } from 'node:events';
+import {
+  type HierarchyNode,
+  type HierarchyResponse,
+  type NormalizedTraceContext,
+  type TraceEvent,
+  type TraceFilters,
+  type TraceListResponse,
+  type TraceRecord,
+  type TraceRequest,
+  type TraceSummary,
+} from './types';
+import { getUsageCostUsd, normalizeTraceContext, safeClone, sanitizeHeaders, toErrorPayload, toSummary } from './utils';
 
-const { EventEmitter } = require('node:events');
-const { normalizeTraceContext, safeClone, sanitizeHeaders, toErrorPayload, toSummary } = require('./utils');
+type MutableHierarchyNode = Omit<HierarchyNode, 'children'> & {
+  children: Map<string, MutableHierarchyNode>;
+};
 
-class TraceStore extends EventEmitter {
-  constructor(options = {}) {
+export class TraceStore extends EventEmitter {
+  maxTraces: number;
+  order: string[];
+  traces: Map<string, TraceRecord>;
+
+  constructor(options: { maxTraces?: number } = {}) {
     super();
     this.maxTraces = Math.max(1, Number(options.maxTraces) || 1000);
     this.order = [];
     this.traces = new Map();
   }
 
-  recordInvokeStart(context, request) {
-    return this.#recordStart('invoke', context, request);
+  recordInvokeStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
+    return this.recordStart('invoke', context, request);
   }
 
-  recordInvokeFinish(traceId, response) {
+  recordInvokeFinish(traceId: string, response: any) {
     const trace = this.traces.get(traceId);
     if (!trace) {
       return;
@@ -25,20 +42,23 @@ class TraceStore extends EventEmitter {
     trace.usage = safeClone(response?.usage);
     trace.status = 'ok';
     trace.endedAt = new Date().toISOString();
-    this.#publish('trace:update', traceId, { trace: this.#cloneTrace(trace) });
+    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
   }
 
-  recordStreamStart(context, request) {
-    return this.#recordStart('stream', context, request);
+  recordStreamStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
+    return this.recordStart('stream', context, request);
   }
 
-  recordStreamChunk(traceId, chunk) {
+  recordStreamChunk(traceId: string, chunk: any) {
     const trace = this.traces.get(traceId);
-    if (!trace) {
+    if (!trace || !trace.stream) {
       return;
     }
 
     const clone = safeClone(chunk);
+    if (clone && typeof clone === 'object') {
+      clone.offsetMs = Math.max(0, Date.now() - Date.parse(trace.startedAt));
+    }
     trace.stream.events.push(clone);
 
     if (chunk?.type === 'chunk') {
@@ -71,14 +91,14 @@ class TraceStore extends EventEmitter {
       trace.endedAt = new Date().toISOString();
     }
 
-    this.#publish('trace:update', traceId, { trace: this.#cloneTrace(trace) });
+    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
   }
 
-  recordStreamFinish(traceId, chunk) {
+  recordStreamFinish(traceId: string, chunk: any) {
     this.recordStreamChunk(traceId, chunk);
   }
 
-  recordError(traceId, error) {
+  recordError(traceId: string, error: unknown) {
     const trace = this.traces.get(traceId);
     if (!trace) {
       return;
@@ -87,12 +107,12 @@ class TraceStore extends EventEmitter {
     trace.error = toErrorPayload(error);
     trace.status = 'error';
     trace.endedAt = new Date().toISOString();
-    this.#publish('trace:update', traceId, { trace: this.#cloneTrace(trace) });
+    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
   }
 
-  list(filters = {}) {
-    const items = this.#filteredTraces(filters).map(toSummary);
-    const response = {
+  list(filters: TraceFilters = {}): TraceListResponse {
+    const items = this.filteredTraces(filters).map(toSummary);
+    const response: TraceListResponse = {
       items,
       total: this.order.length,
       filtered: items.length,
@@ -105,19 +125,19 @@ class TraceStore extends EventEmitter {
     return response;
   }
 
-  get(traceId) {
+  get(traceId: string): TraceRecord | null {
     const trace = this.traces.get(traceId);
-    return trace ? this.#cloneTrace(trace) : null;
+    return trace ? this.cloneTrace(trace) : null;
   }
 
   clear() {
     this.order = [];
     this.traces.clear();
-    this.#publish('trace:clear', null, {});
+    this.publish('trace:clear', null, {});
   }
 
-  hierarchy(filters = {}) {
-    const traces = this.#filteredTraces(filters);
+  hierarchy(filters: TraceFilters = {}): HierarchyResponse {
+    const traces = this.filteredTraces(filters);
     if (filters.groupBy) {
       return {
         total: this.order.length,
@@ -126,62 +146,76 @@ class TraceStore extends EventEmitter {
       };
     }
 
-    const roots = new Map();
+    const roots = new Map<string, MutableHierarchyNode>();
 
     for (const trace of traces) {
-      const chatId = trace.hierarchy.chatId || 'unknown-chat';
-      const chatNode = getOrCreateNode(roots, `chat:${chatId}`, 'chat', `Chat ${chatId}`, { chatId });
-
-      const topLevelAgentId = trace.hierarchy.topLevelAgentId || 'unknown-agent';
-      const agentNode = getOrCreateNode(chatNode.children, `agent:${chatId}:${topLevelAgentId}`, 'agent', topLevelAgentId, {
-        chatId,
-        agentId: topLevelAgentId,
+      const sessionId = trace.hierarchy.sessionId || 'unknown-session';
+      const sessionNode = getOrCreateNode(roots, `session:${sessionId}`, 'session', `Session ${sessionId}`, {
+        sessionId,
+        chatId: trace.hierarchy.chatId,
       });
+      const lineage = [sessionNode];
 
-      let currentNode = agentNode;
+      const rootActorId = trace.hierarchy.rootActorId || 'unknown-actor';
+      const actorNode = getOrCreateNode(sessionNode.children, `actor:${sessionId}:${rootActorId}`, 'actor', rootActorId, {
+        actorId: rootActorId,
+        rootActorId,
+        sessionId,
+        topLevelAgentId: trace.hierarchy.topLevelAgentId,
+      });
+      lineage.push(actorNode);
 
-      if (trace.hierarchy.kind === 'watchdog') {
-        const label = `${trace.hierarchy.watchdogPhase || 'watchdog'} filter`;
+      let currentNode = actorNode;
+
+      if (trace.hierarchy.kind === 'guardrail') {
+        const label = `${trace.hierarchy.guardrailPhase || 'guardrail'} guardrail`;
         currentNode = getOrCreateNode(
           currentNode.children,
-          `watchdog:${chatId}:${topLevelAgentId}:${trace.context.systemType || label}`,
-          'watchdog',
+          `guardrail:${sessionId}:${rootActorId}:${trace.context.guardrailType || label}`,
+          'guardrail',
           label,
           {
+            guardrailPhase: trace.hierarchy.guardrailPhase || null,
+            guardrailType: trace.context.guardrailType || null,
             systemType: trace.context.systemType || null,
             watchdogPhase: trace.hierarchy.watchdogPhase || null,
           },
         );
-      } else if (trace.hierarchy.delegatedAgentId) {
+        lineage.push(currentNode);
+      } else if (trace.hierarchy.childActorId) {
         currentNode = getOrCreateNode(
           currentNode.children,
-          `delegated:${chatId}:${topLevelAgentId}:${trace.hierarchy.delegatedAgentId}`,
-          'delegated-agent',
-          trace.hierarchy.delegatedAgentId,
+          `child-actor:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId}`,
+          'child-actor',
+          trace.hierarchy.childActorId,
           {
-            agentId: trace.hierarchy.delegatedAgentId,
+            actorId: trace.hierarchy.childActorId,
+            childActorId: trace.hierarchy.childActorId,
+            delegatedAgentId: trace.hierarchy.delegatedAgentId,
           },
         );
+        lineage.push(currentNode);
       }
 
-      if (trace.hierarchy.workflowState) {
+      if (trace.hierarchy.stage) {
         currentNode = getOrCreateNode(
           currentNode.children,
-          `state:${chatId}:${topLevelAgentId}:${trace.hierarchy.delegatedAgentId || 'root'}:${trace.hierarchy.workflowState}`,
-          'workflow-state',
-          trace.hierarchy.workflowState,
+          `stage:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId || 'root'}:${trace.hierarchy.stage}`,
+          'stage',
+          trace.hierarchy.stage,
           {
+            stage: trace.hierarchy.stage,
             workflowState: trace.hierarchy.workflowState,
           },
         );
+        lineage.push(currentNode);
       }
 
       const traceNode = createTraceNode(trace);
       currentNode.children.set(traceNode.id, traceNode);
 
-      for (const node of new Set([chatNode, agentNode, currentNode])) {
-        node.traceIds.push(trace.id);
-        node.count += 1;
+      for (const node of new Set(lineage)) {
+        applyTraceRollup(node, trace);
       }
     }
 
@@ -192,22 +226,20 @@ class TraceStore extends EventEmitter {
     };
   }
 
-  #recordStart(mode, context, request) {
-    const traceContext = normalizeTraceContext(context, mode);
+  private recordStart(mode: TraceRecord['mode'], context: NormalizedTraceContext | undefined, request: TraceRequest): string {
+    const traceContext = normalizeTraceContext(context as any, mode);
     const traceId = randomId();
     const startedAt = new Date().toISOString();
-    const trace = {
-      id: traceId,
-      mode,
-      status: 'pending',
-      startedAt,
-      endedAt: null,
-      provider: traceContext.provider,
-      model: traceContext.model,
-      kind: traceContext.kind,
-      tags: traceContext.tags,
-      hierarchy: traceContext.hierarchy,
+    const trace: TraceRecord = {
       context: traceContext,
+      endedAt: null,
+      error: null,
+      hierarchy: traceContext.hierarchy,
+      id: traceId,
+      kind: traceContext.kind,
+      mode,
+      model: traceContext.model,
+      provider: traceContext.provider,
       request: {
         input: safeClone(request?.input),
         options: {
@@ -216,13 +248,13 @@ class TraceStore extends EventEmitter {
         },
       },
       response: null,
-      usage: null,
-      error: null,
+      startedAt,
+      status: 'pending',
       stream:
         mode === 'stream'
           ? {
-              events: [],
               chunkCount: 0,
+              events: [],
               firstChunkMs: null,
               reconstructed: {
                 message: { role: null, content: null },
@@ -231,30 +263,34 @@ class TraceStore extends EventEmitter {
               },
             }
           : null,
+      tags: traceContext.tags,
+      usage: null,
     };
 
     this.order.push(traceId);
     this.traces.set(traceId, trace);
-    this.#evictIfNeeded();
-    this.#publish('trace:add', traceId, { trace: this.#cloneTrace(trace) });
+    this.evictIfNeeded();
+    this.publish('trace:add', traceId, { trace: this.cloneTrace(trace) });
 
     return traceId;
   }
 
-  #evictIfNeeded() {
+  private evictIfNeeded() {
     while (this.order.length > this.maxTraces) {
       const oldest = this.order.shift();
-      const removed = this.traces.get(oldest);
-      this.traces.delete(oldest);
-      this.#publish('trace:evict', oldest, removed ? { trace: this.#cloneTrace(removed) } : {});
+      const removed = oldest ? this.traces.get(oldest) : null;
+      if (oldest) {
+        this.traces.delete(oldest);
+      }
+      this.publish('trace:evict', oldest || null, removed ? { trace: this.cloneTrace(removed) } : {});
     }
   }
 
-  #cloneTrace(trace) {
+  private cloneTrace(trace: TraceRecord): TraceRecord {
     return safeClone(trace);
   }
 
-  #filteredTraces(filters = {}) {
+  private filteredTraces(filters: TraceFilters = {}): TraceRecord[] {
     const tagFilters = normalizeTagFilters(filters.tags || filters.tagFilters);
 
     return this.order
@@ -292,11 +328,11 @@ class TraceStore extends EventEmitter {
         if (filters.search) {
           const needle = String(filters.search).toLowerCase();
           const haystack = JSON.stringify({
+            context: trace.context,
+            error: trace.error,
             request: trace.request,
             response: trace.response,
             stream: trace.stream,
-            error: trace.error,
-            context: trace.context,
             tags: trace.tags,
           }).toLowerCase();
 
@@ -307,21 +343,23 @@ class TraceStore extends EventEmitter {
 
         return true;
       })
-      .reverse();
+      .reverse() as TraceRecord[];
   }
 
-  #publish(type, traceId, payload) {
-    this.emit('event', {
+  private publish(type: string, traceId: string | null, payload: { trace?: TraceRecord }) {
+    const event: TraceEvent = {
       type,
       traceId,
       timestamp: new Date().toISOString(),
       ...payload,
-    });
+    };
+    this.emit('event', event);
   }
 }
 
-function groupTraceSummaries(items, groupBy) {
-  const groups = new Map();
+function groupTraceSummaries(items: TraceSummary[], groupBy: string): Array<{ count: number; items: TraceSummary[]; value: string }> {
+  const groups = new Map<string, { count: number; items: TraceSummary[]; value: string }>();
+
   for (const item of items) {
     const groupValue = item.tags[groupBy] || 'ungrouped';
     const group = groups.get(groupValue) || {
@@ -337,7 +375,7 @@ function groupTraceSummaries(items, groupBy) {
   return [...groups.values()];
 }
 
-function normalizeTagFilters(value) {
+function normalizeTagFilters(value?: string[]): string[][] {
   if (!value) {
     return [];
   }
@@ -355,7 +393,13 @@ function normalizeTagFilters(value) {
     .filter(([key, filterValue]) => key && filterValue);
 }
 
-function getOrCreateNode(collection, id, type, label, meta = {}) {
+function getOrCreateNode(
+  collection: Map<string, MutableHierarchyNode>,
+  id: string,
+  type: string,
+  label: string,
+  meta: Record<string, any> = {},
+): MutableHierarchyNode {
   if (!collection.has(id)) {
     collection.set(id, {
       id,
@@ -368,16 +412,17 @@ function getOrCreateNode(collection, id, type, label, meta = {}) {
     });
   }
 
-  return collection.get(id);
+  return collection.get(id) as MutableHierarchyNode;
 }
 
-function createTraceNode(trace) {
+function createTraceNode(trace: TraceRecord): MutableHierarchyNode {
   return {
     id: `trace:${trace.id}`,
     type: 'trace',
     label: trace.model ? `${trace.model} ${trace.mode}` : trace.id,
     count: 1,
     meta: {
+      costUsd: getUsageCostUsd(trace.usage),
       traceId: trace.id,
       status: trace.status,
       provider: trace.provider,
@@ -388,7 +433,17 @@ function createTraceNode(trace) {
   };
 }
 
-function serialiseNode(node) {
+function applyTraceRollup(node: MutableHierarchyNode, trace: TraceRecord) {
+  node.traceIds.push(trace.id);
+  node.count += 1;
+
+  const traceCost = getUsageCostUsd(trace.usage);
+  if (traceCost !== null) {
+    node.meta.costUsd = (typeof node.meta.costUsd === 'number' ? node.meta.costUsd : 0) + traceCost;
+  }
+}
+
+function serialiseNode(node: MutableHierarchyNode): HierarchyNode {
   return {
     id: node.id,
     type: node.type,
@@ -400,8 +455,8 @@ function serialiseNode(node) {
   };
 }
 
-function buildGroupHierarchy(traces, groupBy) {
-  const groups = new Map();
+function buildGroupHierarchy(traces: TraceRecord[], groupBy: string): HierarchyNode[] {
+  const groups = new Map<string, MutableHierarchyNode>();
 
   for (const trace of traces) {
     const value = trace.tags[groupBy] || 'ungrouped';
@@ -409,18 +464,13 @@ function buildGroupHierarchy(traces, groupBy) {
       groupBy,
       value,
     });
-    node.traceIds.push(trace.id);
-    node.count += 1;
+    applyTraceRollup(node, trace);
     node.children.set(`trace:${trace.id}`, createTraceNode(trace));
   }
 
   return [...groups.values()].map(serialiseNode);
 }
 
-function randomId() {
+function randomId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
-
-module.exports = {
-  TraceStore,
-};
