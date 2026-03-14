@@ -131,13 +131,13 @@ type HierarchyPayload = {
 };
 
 const MESSAGE_COLLAPSE_CHAR_LIMIT = 900;
-const MESSAGE_COLLAPSE_LINE_LIMIT = 12;
-const MESSAGE_COLLAPSE_HEIGHT_PROSE = "6.5rem";
-const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED = "10.75rem";
-const MESSAGE_COLLAPSE_CHAR_LIMIT_SYSTEM = 320;
-const MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM = 4;
-const MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM = "4.6rem";
-const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM = "7rem";
+const MESSAGE_COLLAPSE_LINE_LIMIT = 10;
+const MESSAGE_COLLAPSE_HEIGHT_PROSE = "9rem";
+const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED = "9rem";
+const MESSAGE_COLLAPSE_CHAR_LIMIT_SYSTEM = 500;
+const MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM = 5;
+const MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM = "9rem";
+const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM = "9rem";
 const TIMELINE_AXIS_STOPS = [0, 0.25, 0.5, 0.75, 1];
 
 type Filters = {
@@ -661,6 +661,7 @@ export function App() {
   const hasActiveFilters = Boolean(
     filters.search || filters.status || filters.kind || filters.tags,
   );
+  const activeTagFilterCount = countTagFilters(filters.tags);
 
   const onFilterChange = (key: keyof Filters, value: string) => {
     startTransition(() => {
@@ -892,9 +893,6 @@ export function App() {
                   <span className="inspector-live-dot" aria-hidden="true" />
                   {eventsConnected ? "Connected" : "Reconnecting"}
                 </span>
-                <span className="inspector-meta">
-                  {data.traces.total} stored
-                </span>
               </div>
               <div className="inspector-header-actions">
                 <Button
@@ -937,14 +935,21 @@ export function App() {
                 <div className="toolbar-actions">
                   <Button
                     variant="outline"
+                    className={cn(
+                      "tag-filter-toggle",
+                      (showAdvancedFilters || activeTagFilterCount > 0) &&
+                        "is-active",
+                    )}
                     onClick={() =>
                       setShowAdvancedFilters((current) => !current)
                     }
                   >
                     <Filter data-icon="inline-start" />
                     {showAdvancedFilters || filters.tags
-                      ? "Hide filters"
-                      : "More filters"}
+                      ? "Hide tag filters"
+                      : activeTagFilterCount > 0
+                        ? `Tag filters · ${activeTagFilterCount}`
+                        : "Tag filters"}
                   </Button>
                   {hasActiveFilters ? (
                     <Button variant="outline" onClick={resetFilters}>
@@ -1099,19 +1104,23 @@ function ThemeSwitcher({
         type="button"
         className={cn("theme-switch-button", theme === "light" && "is-active")}
         aria-pressed={theme === "light"}
+        aria-label="Use light theme"
+        title="Light theme"
         onClick={() => onChange("light")}
       >
         <Sun data-icon="inline-start" />
-        Light
+        <span className="sr-only">Light theme</span>
       </button>
       <button
         type="button"
         className={cn("theme-switch-button", theme === "dark" && "is-active")}
         aria-pressed={theme === "dark"}
+        aria-label="Use dark theme"
+        title="Dark theme"
         onClick={() => onChange("dark")}
       >
         <Moon data-icon="inline-start" />
-        Dark
+        <span className="sr-only">Dark theme</span>
       </button>
     </div>
   );
@@ -1531,20 +1540,26 @@ function HierarchyTimelineOverview({
               <div className="hierarchy-timeline-row-time">
                 {formatTimelineTimestamp(row.startedAt)}
               </div>
-              <div className="hierarchy-timeline-row-labels">
-                <div className="hierarchy-timeline-row-title">
-                  <span className="hierarchy-timeline-row-title-text">
-                    {row.label}
-                  </span>
-                  <Badge
-                    variant="secondary"
-                    className="hierarchy-timeline-pill"
-                    semantic={row.badge}
-                  >
-                    {row.badge}
-                  </Badge>
+              <div className="hierarchy-timeline-row-branch">
+                <div
+                  className="hierarchy-timeline-row-gutter"
+                  aria-hidden="true"
+                />
+                <div className="hierarchy-timeline-row-labels">
+                  <div className="hierarchy-timeline-row-title">
+                    <span className="hierarchy-timeline-row-title-text">
+                      {row.label}
+                    </span>
+                    <Badge
+                      variant="secondary"
+                      className="hierarchy-timeline-pill"
+                      semantic={row.badge}
+                    >
+                      {row.badge}
+                    </Badge>
+                  </div>
+                  <div className="hierarchy-timeline-row-meta">{row.meta}</div>
                 </div>
-                <div className="hierarchy-timeline-row-meta">{row.meta}</div>
               </div>
               <div className="hierarchy-timeline-row-bars">
                 <div
@@ -1650,11 +1665,7 @@ function TraceDetailPanel({
         ? "Running"
         : `${fallbackTrace.durationMs} ms`
       : null;
-  const detailSubtitle = detail
-    ? detailCopy?.subtitle
-    : fallbackTrace
-      ? detailCopy?.subtitle
-      : null;
+  const detailSubtitle = formatTraceProviderSummary(detail ?? fallbackTrace);
   const detailCostUsd = detail
     ? getUsageCostUsd(detail.usage)
     : (fallbackTrace?.costUsd ?? null);
@@ -1665,6 +1676,28 @@ function TraceDetailPanel({
     <div className="trace-detail-panel" role="region" aria-label="Trace detail">
       <div className="trace-detail-header">
         <div className="trace-detail-heading">
+          {detailCopy?.pathParts?.length ? (
+            <div className="trace-detail-breadcrumb" aria-label="Trace path">
+              {detailCopy.pathParts.map((part, index) => (
+                <Fragment key={`${part}-${index}`}>
+                  {index > 0 ? (
+                    <ChevronRight
+                      className="trace-detail-breadcrumb-separator"
+                      aria-hidden="true"
+                    />
+                  ) : null}
+                  <span
+                    className={cn(
+                      "trace-detail-breadcrumb-segment",
+                      index === detailCopy.pathParts.length - 1 && "is-current",
+                    )}
+                  >
+                    {part}
+                  </span>
+                </Fragment>
+              ))}
+            </div>
+          ) : null}
           <div className="trace-detail-title-row">
             <h2>{detailCopy?.title || "Loading trace"}</h2>
             <div className="trace-detail-meta">
@@ -1679,12 +1712,10 @@ function TraceDetailPanel({
               ) : null}
             </div>
           </div>
-          <p>
-            {detailCopy?.path ||
-              "Loading the full request and response context."}
-          </p>
           {detailSubtitle ? (
             <div className="trace-detail-subtitle">{detailSubtitle}</div>
+          ) : detailCopy?.path ? (
+            <div className="trace-detail-subtitle">{detailCopy.path}</div>
           ) : null}
         </div>
         {onBack ? (
@@ -1719,6 +1750,7 @@ function TraceDetailPanel({
                 </Tabs>
                 <Button
                   variant="outline"
+                  className="trace-detail-json-toggle"
                   onClick={() => onToggleJsonMode(activeTab)}
                 >
                   <Boxes data-icon="inline-start" />
@@ -3069,10 +3101,24 @@ function getTraceDisplayCopy(
   >,
 ): {
   path: string;
+  pathParts: string[];
   subtitle: string;
   title: string;
 } {
   const actor = trace.hierarchy.childActorId || trace.hierarchy.rootActorId;
+  const pathParts = getTracePathParts(trace);
+
+  return {
+    path: pathParts.join(" / "),
+    pathParts,
+    subtitle: formatList([actor, trace.provider, trace.model]),
+    title: getTraceTitle(trace),
+  };
+}
+
+function getTracePathParts(
+  trace: Pick<TraceSummary, "hierarchy" | "kind">,
+): string[] {
   const pathParts = [
     `Session ${shortId(trace.hierarchy.sessionId)}`,
     trace.hierarchy.rootActorId,
@@ -3093,11 +3139,21 @@ function getTraceDisplayCopy(
     }
   }
 
-  return {
-    path: pathParts.join(" / "),
-    subtitle: formatList([actor, trace.provider, trace.model]),
-    title: getTraceTitle(trace),
-  };
+  return pathParts;
+}
+
+function formatTraceProviderSummary(
+  trace:
+    | Pick<TraceSummary, "model" | "provider">
+    | Pick<TraceRecord, "model" | "provider">
+    | null
+    | undefined,
+): string | null {
+  if (!trace) {
+    return null;
+  }
+
+  return formatList([trace.provider, trace.model]);
 }
 
 function groupTracesForNav(items: TraceSummary[]): Array<{
@@ -3684,6 +3740,17 @@ function mergeTagFilter(current: string, nextEntry: string): string {
   return [...existing, nextEntry].join(",");
 }
 
+function countTagFilters(value: string): number {
+  if (!value.trim()) {
+    return 0;
+  }
+
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean).length;
+}
+
 function getHierarchyNodeCostUsd(
   node: HierarchyNode | null | undefined,
 ): number | null {
@@ -3822,7 +3889,7 @@ function createCurrencyMetadataEntry(
     label,
     monospace: false,
     secondary,
-    value: formatUsdCost(rawValue) || `$${rawValue.toFixed(4)}`,
+    value: formatUsdCost(rawValue) ?? "$0.0000",
   };
 }
 
