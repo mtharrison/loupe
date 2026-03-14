@@ -34,6 +34,11 @@ export type SessionNavItem = {
   status: "error" | "ok" | "pending";
 };
 
+export type SessionTreeSelection = {
+  selectedNodeId: string | null;
+  selectedTraceId: string | null;
+};
+
 export function deriveSessionNavItems(
   sessionNodes: SessionNavHierarchyNode[],
   traceById: Map<string, SessionNavTraceSummary>,
@@ -41,6 +46,134 @@ export function deriveSessionNavItems(
   return sessionNodes
     .map((node) => deriveSessionNavItem(node, traceById))
     .sort(compareSessionNavItems);
+}
+
+export function sortSessionNodesForNav(
+  sessionNodes: SessionNavHierarchyNode[],
+  traceById: Map<string, SessionNavTraceSummary>,
+): SessionNavHierarchyNode[] {
+  const itemById = new Map(
+    sessionNodes.map((node) => [node.id, deriveSessionNavItem(node, traceById)]),
+  );
+
+  return sessionNodes
+    .slice()
+    .sort(
+      (left, right) =>
+        compareSessionNavItems(
+          itemById.get(left.id) as SessionNavItem,
+          itemById.get(right.id) as SessionNavItem,
+        ),
+    );
+}
+
+export function findSessionNodePath(
+  nodes: SessionNavHierarchyNode[],
+  id: string,
+  trail: SessionNavHierarchyNode[] = [],
+): SessionNavHierarchyNode[] {
+  for (const node of nodes) {
+    const nextTrail = [...trail, node];
+    if (node.id === id) {
+      return nextTrail;
+    }
+
+    const childTrail = findSessionNodePath(node.children, id, nextTrail);
+    if (childTrail.length) {
+      return childTrail;
+    }
+  }
+
+  return [];
+}
+
+export function findSessionNodeById(
+  nodes: SessionNavHierarchyNode[],
+  id: string,
+): SessionNavHierarchyNode | null {
+  return findSessionNodePath(nodes, id).at(-1) ?? null;
+}
+
+export function getNewestTraceIdForNode(
+  node: SessionNavHierarchyNode | null | undefined,
+): string | null {
+  if (!node?.traceIds.length) {
+    return null;
+  }
+
+  if (typeof node.meta?.traceId === "string" && node.meta.traceId) {
+    return node.meta.traceId;
+  }
+
+  return node.traceIds[0] || null;
+}
+
+export function resolveSessionTreeSelection(
+  sessionNodes: SessionNavHierarchyNode[],
+  selectedNodeId: string | null,
+  selectedTraceId: string | null,
+): SessionTreeSelection {
+  const selectedNode = selectedNodeId
+    ? findSessionNodeById(sessionNodes, selectedNodeId)
+    : null;
+  const selectedTraceNode = selectedTraceId
+    ? findSessionNodeById(sessionNodes, `trace:${selectedTraceId}`)
+    : null;
+  const fallbackNode = selectedNode ?? selectedTraceNode ?? sessionNodes[0] ?? null;
+
+  if (!fallbackNode) {
+    return {
+      selectedNodeId: null,
+      selectedTraceId: null,
+    };
+  }
+
+  const nextSelectedNodeId = selectedNode?.id ?? fallbackNode.id;
+  const nextSelectedTraceId =
+    selectedTraceId && fallbackNode.traceIds.includes(selectedTraceId)
+      ? selectedTraceId
+      : getNewestTraceIdForNode(fallbackNode);
+
+  return {
+    selectedNodeId: nextSelectedNodeId,
+    selectedTraceId: nextSelectedTraceId,
+  };
+}
+
+export function getDefaultExpandedSessionTreeNodeIds(
+  sessionNodes: SessionNavHierarchyNode[],
+  activeSessionId: string | null,
+  selectedNodeId: string | null,
+): Set<string> {
+  const expanded = new Set<string>();
+  const activeSession =
+    (activeSessionId
+      ? sessionNodes.find((node) => node.id === activeSessionId) ?? null
+      : null) ?? sessionNodes[0] ?? null;
+
+  if (!activeSession) {
+    return expanded;
+  }
+
+  if (activeSession.children.length) {
+    expanded.add(activeSession.id);
+  }
+
+  visitSessionTree(activeSession.children, (node) => {
+    if (node.children.length && node.type === "actor") {
+      expanded.add(node.id);
+    }
+  });
+
+  if (selectedNodeId) {
+    for (const node of findSessionNodePath([activeSession], selectedNodeId)) {
+      if (node.children.length) {
+        expanded.add(node.id);
+      }
+    }
+  }
+
+  return expanded;
 }
 
 function deriveSessionNavItem(
@@ -216,4 +349,14 @@ function formatCompactTimestamp(value: string): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function visitSessionTree(
+  nodes: SessionNavHierarchyNode[],
+  visitor: (node: SessionNavHierarchyNode) => void,
+) {
+  for (const node of nodes) {
+    visitor(node);
+    visitSessionTree(node.children, visitor);
+  }
 }

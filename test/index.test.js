@@ -16,13 +16,92 @@ const {
   startTraceServer,
   wrapChatModel,
 } = require('../dist/index.js');
-const { deriveSessionNavItems } = require('../dist/session-nav.js');
+const {
+  deriveSessionNavItems,
+  getDefaultExpandedSessionTreeNodeIds,
+  resolveSessionTreeSelection,
+  sortSessionNodesForNav,
+} = require('../dist/session-nav.js');
 
 let nextPort = 4500;
 
 function reservePort() {
   nextPort += 1;
   return nextPort;
+}
+
+function buildSessionTreeFixture() {
+  return [
+    {
+      children: [
+        {
+          children: [
+            {
+              children: [
+                {
+                  children: [],
+                  count: 1,
+                  id: 'trace:trace-stage',
+                  meta: { traceId: 'trace-stage' },
+                  traceIds: ['trace-stage'],
+                  type: 'trace',
+                },
+              ],
+              count: 1,
+              id: 'stage:s1-newer:assistant:review',
+              meta: { stage: 'review' },
+              traceIds: ['trace-stage'],
+              type: 'stage',
+            },
+            {
+              children: [],
+              count: 1,
+              id: 'trace:trace-root',
+              meta: { traceId: 'trace-root' },
+              traceIds: ['trace-root'],
+              type: 'trace',
+            },
+          ],
+          count: 2,
+          id: 'actor:s1-newer:assistant',
+          meta: { actorId: 'assistant' },
+          traceIds: ['trace-stage', 'trace-root'],
+          type: 'actor',
+        },
+      ],
+      count: 2,
+      id: 'session:s1-newer',
+      meta: { costUsd: 0.004, sessionId: 's1-newer' },
+      traceIds: ['trace-stage', 'trace-root'],
+      type: 'session',
+    },
+    {
+      children: [
+        {
+          children: [
+            {
+              children: [],
+              count: 1,
+              id: 'trace:trace-older',
+              meta: { traceId: 'trace-older' },
+              traceIds: ['trace-older'],
+              type: 'trace',
+            },
+          ],
+          count: 1,
+          id: 'actor:s2-older:reviewer',
+          meta: { actorId: 'reviewer' },
+          traceIds: ['trace-older'],
+          type: 'actor',
+        },
+      ],
+      count: 1,
+      id: 'session:s2-older',
+      meta: { costUsd: 0.002, sessionId: 's2-older' },
+      traceIds: ['trace-older'],
+      type: 'session',
+    },
+  ];
 }
 
 afterEach(() => {
@@ -304,10 +383,15 @@ test('session nav items sort by latest activity and aggregate status metadata', 
   ]);
 
   const items = deriveSessionNavItems(sessionNodes, traceById);
+  const sortedNodes = sortSessionNodesForNav(sessionNodes, traceById);
 
   assert.deepEqual(
     items.map((item) => item.id),
     ['session:b8cf8aa5-newest', 'session:d1e2f3a4-error', 'session:e9f0a1b2-missing'],
+  );
+  assert.deepEqual(
+    sortedNodes.map((node) => node.id),
+    items.map((item) => item.id),
   );
   assert.equal(items[0].primaryLabel, 'globalDefault');
   assert.equal(items[0].status, 'pending');
@@ -322,6 +406,57 @@ test('session nav items sort by latest activity and aggregate status metadata', 
 
   assert.equal(items[2].primaryLabel, 'e9f0a1b2');
   assert.equal(items[2].shortSessionId, 'e9f0a1b2');
+});
+
+test('session tree selection keeps the selected structure node and falls back to its newest descendant trace', async () => {
+  const sessionNodes = buildSessionTreeFixture();
+
+  const selection = resolveSessionTreeSelection(
+    sessionNodes,
+    'stage:s1-newer:assistant:review',
+    'missing-trace',
+  );
+
+  assert.deepEqual(selection, {
+    selectedNodeId: 'stage:s1-newer:assistant:review',
+    selectedTraceId: 'trace-stage',
+  });
+});
+
+test('session tree selection falls back to the first visible session when the previous session is filtered out', async () => {
+  const sessionNodes = buildSessionTreeFixture().slice(1);
+
+  const selection = resolveSessionTreeSelection(
+    sessionNodes,
+    'session:s1-newer',
+    'trace-root',
+  );
+
+  assert.deepEqual(selection, {
+    selectedNodeId: 'session:s2-older',
+    selectedTraceId: 'trace-older',
+  });
+});
+
+test('default session tree expansion opens only the active session and its selected path', async () => {
+  const sessionNodes = buildSessionTreeFixture();
+
+  const expanded = getDefaultExpandedSessionTreeNodeIds(
+    sessionNodes,
+    'session:s1-newer',
+    'stage:s1-newer:assistant:review',
+  );
+
+  assert.deepEqual(
+    [...expanded].sort(),
+    [
+      'actor:s1-newer:assistant',
+      'session:s1-newer',
+      'stage:s1-newer:assistant:review',
+    ].sort(),
+  );
+  assert.equal(expanded.has('session:s2-older'), false);
+  assert.equal(expanded.has('actor:s2-older:reviewer'), false);
 });
 
 test('SSE emits trace lifecycle events', async () => {

@@ -42,6 +42,12 @@ import {
 } from "../../src/theme";
 import {
   deriveSessionNavItems,
+  findSessionNodeById,
+  findSessionNodePath,
+  getDefaultExpandedSessionTreeNodeIds,
+  getNewestTraceIdForNode,
+  resolveSessionTreeSelection,
+  sortSessionNodesForNav,
   type SessionNavItem,
 } from "../../src/session-nav";
 
@@ -162,7 +168,6 @@ const MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM = 5;
 const MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM = "9rem";
 const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM = "9rem";
 const TIMELINE_AXIS_STOPS = [0, 0.25, 0.5, 0.75, 1];
-const COMPACT_TIMELINE_AXIS_STOPS = [0, 0.5, 1];
 const EMPTY_TRACE_INSIGHTS: TraceInsights = {
   highlights: [],
   structuredInputs: [],
@@ -184,7 +189,6 @@ type TabId = "context" | "conversation" | "request" | "response" | "stream";
 type JsonMode = "formatted" | "raw";
 
 type TraceTabModes = Partial<Record<TabId, JsonMode>>;
-type NavMode = "sessions" | "traces";
 type TraceEventPayload = {
   trace?: TraceRecord;
   traceId?: string | null;
@@ -262,18 +266,11 @@ export function App() {
     hierarchy: { filtered: 0, rootNodes: [], total: 0 },
     traces: { filtered: 0, items: [], total: 0 },
   });
-  const [navMode, setNavMode] = useState<NavMode>("sessions");
   const [theme, setTheme] = useState<ThemeMode>(() => resolvePreferredTheme());
   const [eventsConnected, setEventsConnected] = useState(false);
   const [expandedNodeOverrides, setExpandedNodeOverrides] = useState<
     Record<string, boolean>
   >({});
-  const [collapsedTraceGroups, setCollapsedTraceGroups] = useState<
-    Record<string, boolean>
-  >({});
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
-    null,
-  );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TraceRecord | null>(null);
@@ -344,9 +341,6 @@ export function App() {
       startTransition(() => {
         setData({ traces, hierarchy });
         setAllSessionCount(nextAllSessionCount);
-        setSelectedSessionId(
-          (current) => current ?? hierarchy.rootNodes[0]?.id ?? null,
-        );
       });
     } finally {
       refreshInFlightRef.current = false;
@@ -486,7 +480,6 @@ export function App() {
         traces: { filtered: 0, items: [], total: 0 },
       });
       setAllSessionCount(0);
-      setSelectedSessionId(null);
       setSelectedNodeId(null);
       setSelectedTraceId(null);
       setDetail(null);
@@ -558,37 +551,55 @@ export function App() {
     () => getMaxDurationMs(traceItems),
     [traceItems],
   );
-  const traceGroups = useMemo(
-    () => groupTracesForNav(traceItems),
-    [traceItems],
-  );
   const sessionNodes = useMemo(
-    () => data.hierarchy.rootNodes.filter((node) => node.type === "session"),
-    [data.hierarchy.rootNodes],
-  );
-  const sessionNodeById = useMemo(
-    () => new Map(sessionNodes.map((node) => [node.id, node])),
-    [sessionNodes],
+    () =>
+      sortSessionNodesForNav(
+        data.hierarchy.rootNodes.filter((node) => node.type === "session"),
+        traceById,
+      ),
+    [data.hierarchy.rootNodes, traceById],
   );
   const sessionNavItems = useMemo(
     () => deriveSessionNavItems(sessionNodes, traceById),
     [sessionNodes, traceById],
   );
+  const sessionNavById = useMemo(
+    () => new Map(sessionNavItems.map((item) => [item.id, item])),
+    [sessionNavItems],
+  );
   const hasActiveFilters = Boolean(
     filters.search || filters.status || filters.kind || filters.tags,
   );
-  const filteredSessionCount = sessionNavItems.length;
+  const filteredSessionCount = sessionNodes.length;
   const hasRecordedSessions = allSessionCount > 0;
   const showFilteredSessionEmptyState =
     hasActiveFilters && hasRecordedSessions && filteredSessionCount === 0;
+  const selectedNodePath = useMemo(
+    () => (selectedNodeId ? findSessionNodePath(sessionNodes, selectedNodeId) : []),
+    [sessionNodes, selectedNodeId],
+  );
+  const selectedTracePath = useMemo(
+    () =>
+      selectedTraceId
+        ? findSessionNodePath(sessionNodes, toTraceNodeId(selectedTraceId))
+        : [],
+    [sessionNodes, selectedTraceId],
+  );
+  const selectedPathIds = useMemo(
+    () => new Set(selectedNodePath.map((node) => node.id)),
+    [selectedNodePath],
+  );
   const selectedSessionNode = useMemo(
     () =>
-      selectedSessionId
-        ? (sessionNodeById.get(selectedSessionId) ?? null)
-        : ((sessionNavItems[0] &&
-            sessionNodeById.get(sessionNavItems[0].id)) ??
-          null),
-    [selectedSessionId, sessionNavItems, sessionNodeById],
+      (selectedNodePath[0]?.type === "session"
+        ? selectedNodePath[0]
+        : null) ??
+      (selectedTracePath[0]?.type === "session"
+        ? selectedTracePath[0]
+        : null) ??
+      sessionNodes[0] ??
+      null,
+    [selectedNodePath, selectedTracePath, sessionNodes],
   );
   const selectedTraceSummary = useMemo(
     () => (selectedTraceId ? (traceById.get(selectedTraceId) ?? null) : null),
@@ -596,66 +607,24 @@ export function App() {
   );
 
   useEffect(() => {
+    const nextSelection = resolveSessionTreeSelection(
+      sessionNodes,
+      selectedNodeId,
+      selectedTraceId,
+    );
+
     if (
-      !selectedSessionId ||
-      !sessionNodeById.has(selectedSessionId)
+      nextSelection.selectedNodeId === selectedNodeId &&
+      nextSelection.selectedTraceId === selectedTraceId
     ) {
-      startTransition(() =>
-        setSelectedSessionId(sessionNavItems[0]?.id ?? null),
-      );
-    }
-  }, [selectedSessionId, sessionNavItems, sessionNodeById]);
-
-  useEffect(() => {
-    if (navMode !== "sessions") {
       return;
     }
 
-    const currentSelectedNode =
-      selectedNodeId && selectedSessionNode
-        ? findNodeById([selectedSessionNode], selectedNodeId)
-        : null;
-    const fallbackTraceId = getNewestTraceId(selectedSessionNode);
-    const fallbackNodeId =
-      currentSelectedNode?.id ??
-      (fallbackTraceId
-        ? toTraceNodeId(fallbackTraceId)
-        : (selectedSessionNode?.id ?? null));
-    if (fallbackNodeId !== selectedNodeId) {
-      startTransition(() => setSelectedNodeId(fallbackNodeId));
-    }
-  }, [navMode, selectedNodeId, selectedSessionNode]);
-
-  useEffect(() => {
-    const hasSelectedTrace = selectedTraceId
-      ? traceItems.some((trace) => trace.id === selectedTraceId)
-      : false;
-
-    if (navMode === "traces") {
-      if (!hasSelectedTrace) {
-        startTransition(() => setSelectedTraceId(traceItems[0]?.id ?? null));
-      }
-      return;
-    }
-
-    const fallbackNode =
-      (selectedNodeId
-        ? findNodeById(data.hierarchy.rootNodes, selectedNodeId)
-        : null) ?? selectedSessionNode;
-    const nextTraceId = hasSelectedTrace
-      ? selectedTraceId
-      : getNewestTraceId(fallbackNode);
-    if (nextTraceId !== selectedTraceId) {
-      startTransition(() => setSelectedTraceId(nextTraceId));
-    }
-  }, [
-    data.hierarchy.rootNodes,
-    navMode,
-    selectedNodeId,
-    selectedSessionNode,
-    selectedTraceId,
-    traceItems,
-  ]);
+    startTransition(() => {
+      setSelectedNodeId(nextSelection.selectedNodeId);
+      setSelectedTraceId(nextSelection.selectedTraceId);
+    });
+  }, [selectedNodeId, selectedTraceId, sessionNodes]);
 
   const loadDetail = useEffectEvent(async (traceId: string | null) => {
     const requestId = detailRequestRef.current + 1;
@@ -690,50 +659,14 @@ export function App() {
   }, [selectedTraceId]);
 
   const defaultExpandedNodeIds = useMemo(
-    () => getDefaultExpandedNodeIds(data.hierarchy.rootNodes),
-    [data.hierarchy.rootNodes],
-  );
-  const selectedNodePath = useMemo(
     () =>
-      selectedNodeId
-        ? findNodePath(data.hierarchy.rootNodes, selectedNodeId)
-        : [],
-    [data.hierarchy.rootNodes, selectedNodeId],
-  );
-  const selectedTimelineModel = useMemo(
-    () =>
-      buildHierarchyTimelineModel(
-        selectedSessionNode,
-        traceById,
+      getDefaultExpandedSessionTreeNodeIds(
+        sessionNodes,
+        selectedSessionNode?.id ?? null,
         selectedNodeId,
-        selectedNodePath,
-        selectedTraceId,
       ),
-    [
-      selectedNodeId,
-      selectedNodePath,
-      selectedSessionNode,
-      selectedTraceId,
-      traceById,
-    ],
+    [selectedNodeId, selectedSessionNode, sessionNodes],
   );
-
-  useEffect(() => {
-    if (!selectedNodePath.length) {
-      return;
-    }
-
-    startTransition(() => {
-      setExpandedNodeOverrides((current) => {
-        const next = { ...current };
-        for (const node of selectedNodePath.slice(0, -1)) {
-          next[node.id] = true;
-        }
-        return next;
-      });
-    });
-  }, [selectedNodePath]);
-
   const activeTabJsonMode = tabModes[detailTab] ?? "formatted";
   const activeTagFilterCount = countTagFilters(filters.tags);
 
@@ -779,29 +712,13 @@ export function App() {
     });
   };
 
-  const toggleTraceGroupCollapse = (groupId: string) => {
-    startTransition(() => {
-      setCollapsedTraceGroups((current) => ({
-        ...current,
-        [groupId]: !current[groupId],
-      }));
-    });
-  };
-
   const resetFilters = () => {
-    const nextSessionNode =
-      (sessionNavItems[0] && sessionNodeById.get(sessionNavItems[0].id)) ??
-      null;
     startTransition(() => {
       setFilters(INITIAL_FILTERS);
       setShowAdvancedFilters(false);
-      setSelectedSessionId(nextSessionNode?.id ?? null);
-      setSelectedNodeId(nextSessionNode?.id ?? null);
-      setSelectedTraceId(
-        navMode === "traces"
-          ? (traceItems[0]?.id ?? null)
-          : getNewestTraceId(nextSessionNode),
-      );
+      setSelectedNodeId(null);
+      setSelectedTraceId(null);
+      setDetailTab("conversation");
     });
   };
 
@@ -842,122 +759,31 @@ export function App() {
     );
   };
 
-  const showSessionsMode = () => {
-    const tracePath = selectedTraceId
-      ? findNodePath(data.hierarchy.rootNodes, `trace:${selectedTraceId}`)
-      : [];
-    const fallbackSessionNode =
-      tracePath[0] ??
-      selectedSessionNode ??
-      ((sessionNavItems[0] && sessionNodeById.get(sessionNavItems[0].id)) ??
-        null);
-    const fallbackNodeId =
-      tracePath[tracePath.length - 1]?.id ??
-      selectedNodeId ??
-      fallbackSessionNode?.id ??
-      null;
-    const nextTraceId =
-      selectedTraceId && traceById.has(selectedTraceId)
-        ? selectedTraceId
-        : getNewestTraceId(fallbackSessionNode);
-
-    startTransition(() => {
-      setNavMode("sessions");
-      setSelectedSessionId(fallbackSessionNode?.id ?? null);
-      setSelectedNodeId(fallbackNodeId);
-      setSelectedTraceId(nextTraceId);
-      setDetailTab("conversation");
-    });
-  };
-
-  const showTracesMode = () => {
-    startTransition(() => {
-      const nextTraceId =
-        selectedTraceId &&
-        traceItems.some((trace) => trace.id === selectedTraceId)
-          ? selectedTraceId
-          : (traceItems[0]?.id ?? null);
-      setNavMode("traces");
-      setSelectedTraceId(nextTraceId);
-      setSelectedNodeId(nextTraceId ? `trace:${nextTraceId}` : selectedNodeId);
-      setDetailTab("conversation");
-      if (nextTraceId) {
-        const nextTrace = traceById.get(nextTraceId);
-        if (nextTrace?.hierarchy.sessionId) {
-          setSelectedSessionId(toSessionNodeId(nextTrace.hierarchy.sessionId));
-        }
-      }
-    });
-  };
-
-  const selectTraceFromList = (traceId: string) => {
-    const trace = traceById.get(traceId);
-    startTransition(() => {
-      setNavMode("traces");
-      setSelectedTraceId(traceId);
-      setSelectedNodeId(`trace:${traceId}`);
-      setDetailTab("conversation");
-      if (trace?.hierarchy.sessionId) {
-        setSelectedSessionId(toSessionNodeId(trace.hierarchy.sessionId));
-      }
-    });
-  };
-
   const handleHierarchySelect = (node: HierarchyNode) => {
-    const nodePath = findNodePath(data.hierarchy.rootNodes, node.id);
     const nextTraceId =
       node.type === "trace"
         ? (node.meta.traceId ?? node.traceIds[0] ?? null)
-        : getNewestTraceId(node);
-    const nextSessionId =
-      nodePath[0]?.type === "session" ? nodePath[0].id : selectedSessionId;
-    const nextSelectedNodeId =
-      node.type === "trace"
-        ? node.id
-        : nextTraceId
-          ? toTraceNodeId(nextTraceId)
-          : node.id;
+        : getNewestTraceIdForNode(node);
 
     startTransition(() => {
-      setNavMode("sessions");
-      setSelectedSessionId(nextSessionId ?? null);
-      setSelectedNodeId(nextSelectedNodeId);
+      setSelectedNodeId(node.id);
       setSelectedTraceId(nextTraceId);
       setDetailTab("conversation");
     });
   };
 
-  const handleTimelineSelect = (nodeId: string) => {
-    const scopeNodes = selectedSessionNode
-      ? [selectedSessionNode]
-      : data.hierarchy.rootNodes;
-    const node =
-      findNodeById(scopeNodes, nodeId) ??
-      findNodeById(data.hierarchy.rootNodes, nodeId);
-    if (!node) {
-      return;
-    }
-
-    handleHierarchySelect(node);
-  };
-
   const navigateToHierarchyNode = (nodeId: string) => {
-    const node = findNodeById(data.hierarchy.rootNodes, nodeId);
+    const node = findSessionNodeById(sessionNodes, nodeId);
     if (!node) {
       return;
     }
 
-    const nodePath = findNodePath(data.hierarchy.rootNodes, nodeId);
-    const nextSessionId =
-      nodePath[0]?.type === "session" ? nodePath[0].id : selectedSessionId;
     const nextTraceId =
       selectedTraceId && node.traceIds.includes(selectedTraceId)
         ? selectedTraceId
-        : getNewestTraceId(node);
+        : getNewestTraceIdForNode(node);
 
     startTransition(() => {
-      setNavMode("sessions");
-      setSelectedSessionId(nextSessionId ?? null);
       setSelectedNodeId(nodeId);
       if (nextTraceId !== selectedTraceId) {
         setSelectedTraceId(nextTraceId);
@@ -969,19 +795,6 @@ export function App() {
   const activeTab = detailTabs.some((tab) => tab.id === detailTab)
     ? detailTab
     : (detailTabs[0]?.id ?? "conversation");
-
-  const handleSessionChange = (sessionId: string) => {
-    const sessionNode = sessionNodeById.get(sessionId) ?? null;
-    const nextTraceId = getNewestTraceId(sessionNode);
-
-    startTransition(() => {
-      setNavMode("sessions");
-      setSelectedSessionId(sessionId);
-      setSelectedNodeId(nextTraceId ? toTraceNodeId(nextTraceId) : sessionId);
-      setSelectedTraceId(nextTraceId);
-      setDetailTab("conversation");
-    });
-  };
 
   return (
     <div className="app-shell">
@@ -1108,21 +921,22 @@ export function App() {
           >
             <Card className="sidebar-card session-sidebar-card inspector-card">
               <div className="session-sidebar-shell">
-                {sessionNavItems.length || hasActiveFilters || hasRecordedSessions ? (
-                  <SessionNavList
+                {sessionNodes.length ? (
+                  <SessionTreeNavigator
+                    defaultExpandedNodeIds={defaultExpandedNodeIds}
+                    expandedNodeOverrides={expandedNodeOverrides}
                     hasActiveFilters={hasActiveFilters}
                     items={sessionNavItems}
-                    onChange={handleSessionChange}
+                    maxDurationMs={navigatorMaxDurationMs}
+                    nodes={sessionNodes}
+                    onSelect={handleHierarchySelect}
+                    onToggle={toggleNodeExpansion}
+                    selectedNodeId={selectedNodeId}
+                    selectedPathIds={selectedPathIds}
+                    selectedTraceId={selectedTraceId}
+                    sessionNavById={sessionNavById}
                     totalCount={allSessionCount}
-                    selectedId={selectedSessionNode?.id ?? null}
-                  />
-                ) : null}
-
-                {selectedTimelineModel ? (
-                  <HierarchyTimelineOverview
-                    axisStops={COMPACT_TIMELINE_AXIS_STOPS}
-                    model={selectedTimelineModel}
-                    onSelectRow={handleTimelineSelect}
+                    traceById={traceById}
                   />
                 ) : (
                   <div className="session-sidebar-empty">
@@ -1142,7 +956,7 @@ export function App() {
                       <EmptyState
                         icon={Network}
                         title="No sessions yet"
-                        description="Trigger any traced LLM call and the session timeline will appear here."
+                        description="Trigger any traced LLM call and the session tree will appear here."
                       />
                     )}
                   </div>
@@ -1162,7 +976,6 @@ export function App() {
                   onApplyTraceFilter={applyTraceFilter}
                   onNavigateHierarchyNode={navigateToHierarchyNode}
                   onTabChange={(value) => setDetailTab(value as TabId)}
-                  onSelectTimelineNode={handleTimelineSelect}
                   onToggleJsonMode={(tabId) =>
                     startTransition(() => {
                       setTabModes((current) => ({
@@ -1174,13 +987,12 @@ export function App() {
                       }));
                     })
                   }
-                  timelineModel={null}
                 />
               ) : (
                 <CardContent className="content-scroll">
                   <EmptyState
                     icon={ArrowUpRight}
-                    title="Select a trace from the session timeline"
+                    title="Select a trace from the session tree"
                     description="Choose any call on the left to inspect the full request, response, context, and stream details."
                   />
                 </CardContent>
@@ -1250,18 +1062,36 @@ function ThemeSwitcher({
   );
 }
 
-function SessionNavList({
+function SessionTreeNavigator({
+  defaultExpandedNodeIds,
+  expandedNodeOverrides,
   hasActiveFilters,
   items,
-  onChange,
-  selectedId,
+  maxDurationMs,
+  nodes,
+  onSelect,
+  onToggle,
+  selectedNodeId,
+  selectedPathIds,
+  selectedTraceId,
+  sessionNavById,
   totalCount,
+  traceById,
 }: {
+  defaultExpandedNodeIds: Set<string>;
+  expandedNodeOverrides: Record<string, boolean>;
   hasActiveFilters: boolean;
   items: SessionNavItem[];
-  onChange: (sessionId: string) => void;
-  selectedId: string | null;
+  maxDurationMs: number;
+  nodes: HierarchyNode[];
+  onSelect: (node: HierarchyNode) => void;
+  onToggle: (id: string) => void;
+  selectedNodeId: string | null;
+  selectedPathIds: Set<string>;
+  selectedTraceId: string | null;
+  sessionNavById: Map<string, SessionNavItem>;
   totalCount: number;
+  traceById: Map<string, TraceSummary>;
 }) {
   const filteredCount = items.length;
   const countLabel =
@@ -1273,61 +1103,32 @@ function SessionNavList({
         );
 
   return (
-    <div className="session-nav-section">
-      <div className="session-nav-header">
-        <div className="session-nav-title-row">
-          <div className="session-nav-title">Sessions</div>
+    <div className="session-tree-section">
+      <div className="session-tree-header">
+        <div className="session-tree-title-row">
+          <div className="session-tree-title">Sessions</div>
           {hasActiveFilters ? (
-            <Badge variant="outline" className="session-nav-filter-badge">
+            <Badge variant="outline" className="session-tree-filter-badge">
               Filtered
             </Badge>
           ) : null}
         </div>
-        <div className="session-nav-meta">
-          {countLabel}
-        </div>
+        <div className="session-tree-meta">{countLabel}</div>
       </div>
-      <div className="session-nav-list" role="list" aria-label="Sessions">
-        {items.map((item) => {
-          const costLabel = formatUsdCost(item.costUsd);
-          const detailLabel =
-            formatList([formatCountLabel(item.callCount, "call"), costLabel]) ||
-            formatCountLabel(item.callCount, "call");
-          const badge = getSessionNavBadge(item);
-
-          return (
-            <button
-              key={item.id}
-              type="button"
-              role="listitem"
-              className={cn(
-                "session-nav-card",
-                item.id === selectedId && "is-active",
-              )}
-              aria-pressed={item.id === selectedId}
-              onClick={() => onChange(item.id)}
-            >
-              <div className="session-nav-card-header">
-                <div
-                  className="session-nav-card-title"
-                  title={item.primaryLabel}
-                >
-                  {item.primaryLabel}
-                </div>
-                {item.latestTimestamp ? (
-                  <div className="session-nav-card-time">
-                    {item.latestTimestamp}
-                  </div>
-                ) : null}
-              </div>
-              <div className="session-nav-card-meta">{detailLabel}</div>
-              <div className="session-nav-card-footer">
-                <div className="session-nav-card-id">{item.shortSessionId}</div>
-                {badge}
-              </div>
-            </button>
-          );
-        })}
+      <div className="session-tree-scroll">
+        <HierarchyTree
+          defaultExpandedNodeIds={defaultExpandedNodeIds}
+          expandedNodeOverrides={expandedNodeOverrides}
+          maxDurationMs={maxDurationMs}
+          nodes={nodes}
+          onSelect={onSelect}
+          onToggle={onToggle}
+          selectedNodeId={selectedNodeId}
+          selectedPathIds={selectedPathIds}
+          selectedTraceId={selectedTraceId}
+          sessionNavById={sessionNavById}
+          traceById={traceById}
+        />
       </div>
     </div>
   );
@@ -1371,7 +1172,9 @@ function HierarchyTree({
   onSelect,
   onToggle,
   selectedNodeId,
+  selectedPathIds,
   selectedTraceId,
+  sessionNavById,
   traceById,
 }: {
   defaultExpandedNodeIds: Set<string>;
@@ -1381,7 +1184,9 @@ function HierarchyTree({
   onSelect: (node: HierarchyNode) => void;
   onToggle: (id: string) => void;
   selectedNodeId: string | null;
+  selectedPathIds: Set<string>;
   selectedTraceId: string | null;
+  sessionNavById: Map<string, SessionNavItem>;
   traceById: Map<string, TraceSummary>;
 }) {
   return (
@@ -1397,7 +1202,9 @@ function HierarchyTree({
           onSelect={onSelect}
           onToggle={onToggle}
           selectedNodeId={selectedNodeId}
+          selectedPathIds={selectedPathIds}
           selectedTraceId={selectedTraceId}
+          sessionNavById={sessionNavById}
           traceById={traceById}
         />
       ))}
@@ -1414,7 +1221,9 @@ function HierarchyTreeNode({
   onSelect,
   onToggle,
   selectedNodeId,
+  selectedPathIds,
   selectedTraceId,
+  sessionNavById,
   traceById,
 }: {
   defaultExpandedNodeIds: Set<string>;
@@ -1425,17 +1234,24 @@ function HierarchyTreeNode({
   onSelect: (node: HierarchyNode) => void;
   onToggle: (id: string) => void;
   selectedNodeId: string | null;
+  selectedPathIds: Set<string>;
   selectedTraceId: string | null;
+  sessionNavById: Map<string, SessionNavItem>;
   traceById: Map<string, TraceSummary>;
 }) {
   const isExpandable = node.children.length > 0;
+  const isForcedExpanded = isExpandable && selectedPathIds.has(node.id);
+  const expandedOverride = expandedNodeOverrides[node.id];
   const isExpanded =
     isExpandable &&
-    (expandedNodeOverrides[node.id] ?? defaultExpandedNodeIds.has(node.id));
+    (expandedOverride ?? (isForcedExpanded || defaultExpandedNodeIds.has(node.id)));
+  const isInPath = selectedPathIds.has(node.id);
   const nodeCopy = getHierarchyNodeCopy(node, traceById);
   const trace = node.meta.traceId
     ? (traceById.get(node.meta.traceId) ?? null)
     : null;
+  const sessionNavItem =
+    node.type === "session" ? (sessionNavById.get(node.id) ?? null) : null;
 
   if (node.type === "trace" && trace) {
     return (
@@ -1445,9 +1261,32 @@ function HierarchyTreeNode({
         node={node}
         nodeCopy={nodeCopy}
         onSelect={onSelect}
+        inPath={isInPath}
         selected={selectedNodeId === node.id}
         selectedTrace={selectedTraceId === trace.id}
         trace={trace}
+      />
+    );
+  }
+
+  if (sessionNavItem) {
+    return (
+      <SessionHierarchyBranch
+        depth={depth}
+        defaultExpandedNodeIds={defaultExpandedNodeIds}
+        expandedNodeOverrides={expandedNodeOverrides}
+        isExpanded={isExpanded}
+        item={sessionNavItem}
+        maxDurationMs={maxDurationMs}
+        node={node}
+        onSelect={onSelect}
+        onToggle={onToggle}
+        selected={selectedNodeId === node.id}
+        selectedNodeId={selectedNodeId}
+        selectedPathIds={selectedPathIds}
+        selectedTraceId={selectedTraceId}
+        sessionNavById={sessionNavById}
+        traceById={traceById}
       />
     );
   }
@@ -1461,6 +1300,7 @@ function HierarchyTreeNode({
         className={clsx(
           "tree-node-card",
           selectedNodeId === node.id && "is-active",
+          isInPath && "is-in-path",
           node.type === "trace" && "is-trace",
         )}
       >
@@ -1487,13 +1327,19 @@ function HierarchyTreeNode({
           onClick={() => onSelect(node)}
         >
           <span className="tree-node-copy">
-            <span className="tree-node-label">{nodeCopy.label}</span>
+            <span className="tree-node-heading">
+              <span className="tree-node-label">{nodeCopy.label}</span>
+              <Badge
+                variant="secondary"
+                className="tree-node-inline-badge"
+                semantic={nodeCopy.badge}
+              >
+                {nodeCopy.badge}
+              </Badge>
+            </span>
             <span className="tree-node-meta">{nodeCopy.meta}</span>
           </span>
         </button>
-        <Badge variant="secondary" semantic={nodeCopy.badge}>
-          {nodeCopy.badge}
-        </Badge>
       </div>
       {isExpanded ? (
         <div className="tree-node-children">
@@ -1508,7 +1354,9 @@ function HierarchyTreeNode({
               onSelect={onSelect}
               onToggle={onToggle}
               selectedNodeId={selectedNodeId}
+              selectedPathIds={selectedPathIds}
               selectedTraceId={selectedTraceId}
+              sessionNavById={sessionNavById}
               traceById={traceById}
             />
           ))}
@@ -1518,54 +1366,171 @@ function HierarchyTreeNode({
   );
 }
 
-function TraceNavigatorItem({
+function SessionHierarchyBranch({
+  defaultExpandedNodeIds,
+  depth,
+  expandedNodeOverrides,
+  isExpanded,
+  item,
   maxDurationMs,
-  onClick,
+  node,
+  onSelect,
+  onToggle,
   selected,
-  trace,
+  selectedNodeId,
+  selectedPathIds,
+  selectedTraceId,
+  sessionNavById,
+  traceById,
 }: {
+  defaultExpandedNodeIds: Set<string>;
+  depth: number;
+  expandedNodeOverrides: Record<string, boolean>;
+  isExpanded: boolean;
+  item: SessionNavItem;
   maxDurationMs: number;
-  onClick: () => void;
+  node: HierarchyNode;
+  onSelect: (node: HierarchyNode) => void;
+  onToggle: (id: string) => void;
   selected: boolean;
-  trace: TraceSummary;
+  selectedNodeId: string | null;
+  selectedPathIds: Set<string>;
+  selectedTraceId: string | null;
+  sessionNavById: Map<string, SessionNavItem>;
+  traceById: Map<string, TraceSummary>;
 }) {
-  const copy = getTraceDisplayCopy(trace);
-  const traceCostLabel = formatUsdCost(trace.costUsd);
+  const detailLabel =
+    formatList([
+      formatCountLabel(item.callCount, "call"),
+      formatUsdCost(item.costUsd),
+    ]) || formatCountLabel(item.callCount, "call");
+  const sessionSelectedPath = selectedNodeId
+    ? findSessionNodePath([node], selectedNodeId)
+    : [];
+  const sessionTimelineModel = buildHierarchyTimelineModel(
+    node,
+    traceById,
+    selectedNodeId,
+    sessionSelectedPath as HierarchyNode[],
+    selectedTraceId,
+  );
+  const sessionTimelineRow = sessionTimelineModel?.rows[0] ?? null;
+  const showEmbeddedTimeline =
+    isExpanded && Boolean(sessionTimelineModel?.rows.length);
 
   return (
-    <button
-      type="button"
-      className={cn("nav-item trace-nav-item", selected && "is-active")}
-      onClick={onClick}
+    <div
+      className="tree-node-wrap"
+      style={{ "--depth": String(depth) } as CSSProperties}
     >
-      <div className="nav-item-copy">
-        <div className="trace-nav-kicker">{getTraceActorLabel(trace)}</div>
-        <div className="nav-item-title">{copy.title}</div>
-        <div className="trace-nav-meta-row">
-          <span>{formatTimelineTimestamp(trace.startedAt)}</span>
-          <span>
-            {formatList([trace.provider, trace.model]) || "Unknown model"}
+      <div
+        className={clsx(
+          "tree-node-card tree-session-card",
+          selected && "is-active",
+          selectedPathIds.has(node.id) && "is-in-path",
+        )}
+      >
+        <button
+          type="button"
+          className={clsx(
+            "tree-node-toggle",
+            !node.children.length && "is-static",
+          )}
+          disabled={!node.children.length}
+          onClick={() => {
+            if (node.children.length) {
+              onToggle(node.id);
+            }
+          }}
+          aria-label={
+            node.children.length
+              ? `${isExpanded ? "Collapse" : "Expand"} ${item.primaryLabel}`
+              : undefined
+          }
+        >
+          <ChevronRight className={clsx(isExpanded && "is-open")} />
+        </button>
+        <button
+          type="button"
+          className="tree-node-select session-tree-select"
+          onClick={() => onSelect(node)}
+        >
+          <span className="tree-node-copy session-tree-copy">
+            <span className="session-tree-card-header">
+              <span className="session-tree-card-title" title={item.primaryLabel}>
+                {item.primaryLabel}
+              </span>
+              {item.latestTimestamp ? (
+                <span className="session-tree-card-time">
+                  {item.latestTimestamp}
+                </span>
+              ) : null}
+            </span>
+            <span className="tree-node-meta">{detailLabel}</span>
+            <span className="session-tree-card-footer">
+              <span className="session-tree-card-id">{item.shortSessionId}</span>
+              <span className="session-tree-card-badges">
+                <Badge variant="outline">Session</Badge>
+                {getSessionNavBadge(item)}
+              </span>
+            </span>
           </span>
-        </div>
-      </div>
-      <div className="nav-item-side">
-        <TraceElapsedBar
-          durationMs={trace.durationMs}
-          maxDurationMs={maxDurationMs}
-        />
-        <div className="nav-item-side-meta">
-          {traceCostLabel ? (
-            <TraceMetricPill tone="cost">{traceCostLabel}</TraceMetricPill>
+          {sessionTimelineModel && sessionTimelineRow ? (
+            <SessionTreeTimelineBar
+              model={sessionTimelineModel}
+              row={sessionTimelineRow}
+            />
           ) : null}
-          <StatusBadge status={trace.status} />
-        </div>
+        </button>
       </div>
-    </button>
+      {showEmbeddedTimeline && sessionTimelineModel ? (
+        <div className="session-tree-timeline-shell">
+          <div
+            className="session-tree-timeline-list"
+            role="list"
+            aria-label="Session timeline"
+          >
+            <HierarchyTimelineRows
+              className="is-embedded"
+              model={sessionTimelineModel}
+              onSelectRow={(nodeId) => {
+                const selectedTimelineNode = findSessionNodeById([node], nodeId);
+                if (selectedTimelineNode) {
+                  onSelect(selectedTimelineNode as HierarchyNode);
+                }
+              }}
+              rows={sessionTimelineModel.rows.slice(1)}
+            />
+          </div>
+        </div>
+      ) : isExpanded ? (
+        <div className="tree-node-children">
+          {node.children.map((child) => (
+            <HierarchyTreeNode
+              key={child.id}
+              defaultExpandedNodeIds={defaultExpandedNodeIds}
+              depth={depth + 1}
+              expandedNodeOverrides={expandedNodeOverrides}
+              maxDurationMs={maxDurationMs}
+              node={child}
+              onSelect={onSelect}
+              onToggle={onToggle}
+              selectedNodeId={selectedNodeId}
+              selectedPathIds={selectedPathIds}
+              selectedTraceId={selectedTraceId}
+              sessionNavById={sessionNavById}
+              traceById={traceById}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
 function TraceHierarchyLeaf({
   depth,
+  inPath,
   maxDurationMs,
   node,
   nodeCopy,
@@ -1575,6 +1540,7 @@ function TraceHierarchyLeaf({
   trace,
 }: {
   depth: number;
+  inPath: boolean;
   maxDurationMs: number;
   node: HierarchyNode;
   nodeCopy: { badge: string; label: string; meta: string };
@@ -1591,6 +1557,7 @@ function TraceHierarchyLeaf({
       <div
         className={clsx(
           "tree-node-card is-trace",
+          inPath && "is-in-path",
           selected && "is-active",
           selectedTrace && "is-detail-trace",
         )}
@@ -1689,6 +1656,40 @@ function TraceElapsedBar({
       </span>
       <span className="trace-elapsed-label">{durationLabel}</span>
     </div>
+  );
+}
+
+function SessionTreeTimelineBar({
+  model,
+  row,
+}: {
+  model: HierarchyTimelineModel;
+  row: HierarchyTimelineRow;
+}) {
+  return (
+    <span
+      className="session-tree-timeline"
+      style={
+        {
+          "--session-tree-offset":
+            model.durationMs > 0 ? String(row.offsetMs / model.durationMs) : "0",
+          "--session-tree-span":
+            model.durationMs > 0 ? String(row.durationMs / model.durationMs) : "1",
+        } as CSSProperties
+      }
+    >
+      <span className="session-tree-timeline-meta">
+        <span className="session-tree-timeline-start">
+          {formatTimelineTimestamp(row.startedAt)}
+        </span>
+        <span className="session-tree-timeline-duration">
+          {formatElapsedLabel(row.durationMs)}
+        </span>
+      </span>
+      <span className="session-tree-timeline-track" aria-hidden="true">
+        <span className="session-tree-timeline-bar" />
+      </span>
+    </span>
   );
 }
 
@@ -1800,161 +1801,168 @@ function HierarchyTimelineOverview({
         role="list"
         aria-label="Nested session timeline"
       >
-        {model.rows.map((row) => {
-          const isTraceRow = row.type === "trace";
-          const rowClassName = cn(
-            "hierarchy-timeline-row",
-            isTraceRow ? "is-clickable" : "is-structure",
-            row.depth === 0 && "is-root",
-            row.isActive && "is-active",
-            row.isDetailTrace && "is-detail-trace",
-            row.isInPath && "is-in-path",
-            `is-${row.type.replace(/[^a-z0-9-]/gi, "-")}`,
-          );
-          const rowStyle = {
-            "--timeline-depth": String(row.depth),
-            "--timeline-offset": String(
-              model.durationMs > 0 ? row.offsetMs / model.durationMs : 0,
-            ),
-            "--timeline-span": String(
-              model.durationMs > 0 ? row.durationMs / model.durationMs : 1,
-            ),
-          } as CSSProperties;
-          const rowContent = (
-            <Fragment>
-              <div className="hierarchy-timeline-row-time">
-                {formatTimelineTimestamp(row.startedAt)}
-              </div>
-              <div className="hierarchy-timeline-row-branch">
-                <div
-                  className="hierarchy-timeline-row-gutter"
-                  aria-hidden="true"
-                >
-                  {row.ancestorContinuations.map((continues, index) => (
-                    <span
-                      key={`${row.id}-ancestor-${index}`}
-                      className={cn(
-                        "hierarchy-timeline-row-ancestor",
-                        continues && "has-line",
-                      )}
-                      style={
-                        {
-                          "--timeline-connector-index": String(index),
-                        } as CSSProperties
-                      }
-                    />
-                  ))}
-                  {row.depth > 0 ? (
-                    <span
-                      className="hierarchy-timeline-row-connector"
-                      style={
-                        {
-                          "--timeline-connector-index": String(
-                            row.depth - 1,
-                          ),
-                        } as CSSProperties
-                      }
-                    >
-                      <span className="hierarchy-timeline-row-connector-top" />
-                      <span className="hierarchy-timeline-row-connector-elbow" />
-                      <span
-                        className={cn(
-                          "hierarchy-timeline-row-connector-bottom",
-                          (row.hasVisibleChildren || !row.isLastSibling) &&
-                            "has-line",
-                        )}
-                      />
-                    </span>
-                  ) : null}
-                </div>
-                <div className="hierarchy-timeline-row-labels">
-                  <div className="hierarchy-timeline-row-title">
-                    <span className="hierarchy-timeline-row-title-text">
-                      {row.label}
-                    </span>
-                    <Badge
-                      variant="secondary"
-                      className="hierarchy-timeline-pill"
-                      semantic={row.badge}
-                    >
-                      {row.badge}
-                    </Badge>
-                    {row.hasStructuredInput ? (
-                      <span
-                        className="hierarchy-timeline-row-flag"
-                        title="Structured input detected for this call"
-                      >
-                        Structured input
-                      </span>
-                    ) : null}
-                    {row.hasHighlights && !row.hasStructuredInput ? (
-                      <span
-                        className="hierarchy-timeline-row-flag is-highlight"
-                        title="Trace insights available"
-                      >
-                        Insight
-                      </span>
-                    ) : null}
-                  </div>
-                  <div className="hierarchy-timeline-row-meta">{row.meta}</div>
-                </div>
-              </div>
-              <div className="hierarchy-timeline-row-bars">
-                <div
-                  className="hierarchy-timeline-row-track"
-                  aria-hidden="true"
-                >
-                  <span className="hierarchy-timeline-row-bar" />
-                </div>
-                <div className="hierarchy-timeline-row-duration">
-                  {formatElapsedLabel(row.durationMs)}
-                </div>
-              </div>
-            </Fragment>
-          );
-
-          if (isTraceRow) {
-            return (
-              <div
-                key={row.id}
-                role="listitem"
-                title={buildHierarchyTimelineRowTooltip(row)}
-                aria-current={
-                  row.isActive || row.isDetailTrace ? "true" : undefined
-                }
-                data-hierarchy-row-id={row.id}
-              >
-                <button
-                  type="button"
-                  className={rowClassName}
-                  style={rowStyle}
-                  onClick={() => onSelectRow(row.id)}
-                >
-                  {rowContent}
-                </button>
-              </div>
-            );
-          }
-
-          return (
-            <div
-              key={row.id}
-              role="listitem"
-              className={rowClassName}
-              style={rowStyle}
-              title={buildHierarchyTimelineRowTooltip(row)}
-              aria-current={
-                row.isActive || row.isDetailTrace ? "true" : undefined
-              }
-              data-hierarchy-row-id={row.id}
-            >
-              {rowContent}
-            </div>
-          );
-        })}
+        <HierarchyTimelineRows
+          model={model}
+          onSelectRow={onSelectRow}
+          rows={model.rows}
+        />
       </div>
     </div>
   );
+}
+
+function HierarchyTimelineRows({
+  className,
+  model,
+  onSelectRow,
+  rows,
+}: {
+  className?: string;
+  model: HierarchyTimelineModel;
+  onSelectRow: (nodeId: string) => void;
+  rows: HierarchyTimelineRow[];
+}) {
+  return rows.map((row) => {
+    const isTraceRow = row.type === "trace";
+    const rowClassName = cn(
+      "hierarchy-timeline-row",
+      className,
+      isTraceRow ? "is-clickable" : "is-structure",
+      row.depth === 0 && "is-root",
+      row.isActive && "is-active",
+      row.isDetailTrace && "is-detail-trace",
+      row.isInPath && "is-in-path",
+      `is-${row.type.replace(/[^a-z0-9-]/gi, "-")}`,
+    );
+    const rowStyle = {
+      "--timeline-depth": String(row.depth),
+      "--timeline-offset": String(
+        model.durationMs > 0 ? row.offsetMs / model.durationMs : 0,
+      ),
+      "--timeline-span": String(
+        model.durationMs > 0 ? row.durationMs / model.durationMs : 1,
+      ),
+    } as CSSProperties;
+    const rowContent = (
+      <Fragment>
+        <div className="hierarchy-timeline-row-time">
+          {formatTimelineTimestamp(row.startedAt)}
+        </div>
+        <div className="hierarchy-timeline-row-branch">
+          <div className="hierarchy-timeline-row-gutter" aria-hidden="true">
+            {row.ancestorContinuations.map((continues, index) => (
+              <span
+                key={`${row.id}-ancestor-${index}`}
+                className={cn(
+                  "hierarchy-timeline-row-ancestor",
+                  continues && "has-line",
+                )}
+                style={
+                  {
+                    "--timeline-connector-index": String(index),
+                  } as CSSProperties
+                }
+              />
+            ))}
+            {row.depth > 0 ? (
+              <span
+                className="hierarchy-timeline-row-connector"
+                style={
+                  {
+                    "--timeline-connector-index": String(row.depth - 1),
+                  } as CSSProperties
+                }
+              >
+                <span className="hierarchy-timeline-row-connector-top" />
+                <span className="hierarchy-timeline-row-connector-elbow" />
+                <span
+                  className={cn(
+                    "hierarchy-timeline-row-connector-bottom",
+                    (row.hasVisibleChildren || !row.isLastSibling) &&
+                      "has-line",
+                  )}
+                />
+              </span>
+            ) : null}
+          </div>
+          <div className="hierarchy-timeline-row-labels">
+            <div className="hierarchy-timeline-row-title">
+              <span className="hierarchy-timeline-row-title-text">
+                {row.label}
+              </span>
+              <Badge
+                variant="secondary"
+                className="hierarchy-timeline-pill"
+                semantic={row.badge}
+              >
+                {row.badge}
+              </Badge>
+              {row.hasStructuredInput ? (
+                <span
+                  className="hierarchy-timeline-row-flag"
+                  title="Structured input detected for this call"
+                >
+                  Structured input
+                </span>
+              ) : null}
+              {row.hasHighlights && !row.hasStructuredInput ? (
+                <span
+                  className="hierarchy-timeline-row-flag is-highlight"
+                  title="Trace insights available"
+                >
+                  Insight
+                </span>
+              ) : null}
+            </div>
+            <div className="hierarchy-timeline-row-meta">{row.meta}</div>
+          </div>
+        </div>
+        <div className="hierarchy-timeline-row-bars">
+          <div className="hierarchy-timeline-row-track" aria-hidden="true">
+            <span className="hierarchy-timeline-row-bar" />
+          </div>
+          <div className="hierarchy-timeline-row-duration">
+            {formatElapsedLabel(row.durationMs)}
+          </div>
+        </div>
+      </Fragment>
+    );
+
+    if (isTraceRow) {
+      return (
+        <div
+          key={row.id}
+          role="listitem"
+          title={buildHierarchyTimelineRowTooltip(row)}
+          aria-current={row.isActive || row.isDetailTrace ? "true" : undefined}
+          data-hierarchy-row-id={row.id}
+        >
+          <button
+            type="button"
+            className={rowClassName}
+            style={rowStyle}
+            onClick={() => onSelectRow(row.id)}
+          >
+            {rowContent}
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        key={row.id}
+        role="listitem"
+        className={rowClassName}
+        style={rowStyle}
+        title={buildHierarchyTimelineRowTooltip(row)}
+        aria-current={row.isActive || row.isDetailTrace ? "true" : undefined}
+        data-hierarchy-row-id={row.id}
+      >
+        {rowContent}
+      </div>
+    );
+  });
 }
 
 function TraceDetailPanel({
@@ -1967,10 +1975,8 @@ function TraceDetailPanel({
   onApplyTraceFilter,
   onBack,
   onNavigateHierarchyNode,
-  onSelectTimelineNode,
   onTabChange,
   onToggleJsonMode,
-  timelineModel,
 }: {
   activeTab: TabId;
   detail: TraceRecord | null;
@@ -1981,10 +1987,8 @@ function TraceDetailPanel({
   onApplyTraceFilter: (intent: TraceFilterIntent) => void;
   onBack?: () => void;
   onNavigateHierarchyNode: (nodeId: string) => void;
-  onSelectTimelineNode: (nodeId: string) => void;
   onTabChange: (value: string) => void;
   onToggleJsonMode: (tabId: TabId) => void;
-  timelineModel: HierarchyTimelineModel | null;
 }) {
   const traceDetailPrimaryRef = useRef<HTMLDivElement | null>(null);
   const [showInlineContextRail, setShowInlineContextRail] = useState(false);
@@ -2006,7 +2010,6 @@ function TraceDetailPanel({
     ? getUsageCostUsd(detail.usage)
     : (fallbackTrace?.costUsd ?? null);
   const detailCostLabel = formatUsdCost(detailCostUsd);
-  const hasSecondaryInspector = Boolean(detail && timelineModel);
   const detailFilterSource = detail ?? fallbackTrace;
   const canInlineContextRailTab =
     activeTab === "conversation" ||
@@ -2153,12 +2156,7 @@ function TraceDetailPanel({
 
       <div className="trace-detail-body">
         {detail ? (
-          <div
-            className={cn(
-              "trace-detail-main",
-              hasSecondaryInspector && "has-secondary-inspector",
-            )}
-          >
+          <div className="trace-detail-main">
             <div className="trace-detail-primary" ref={traceDetailPrimaryRef}>
               <div className="trace-detail-toolbar">
                 <div className="trace-detail-tabs-shell">
@@ -2225,15 +2223,6 @@ function TraceDetailPanel({
                 </div>
               </div>
             </div>
-
-            {timelineModel ? (
-              <aside className="trace-detail-secondary">
-                <HierarchyTimelineOverview
-                  model={timelineModel}
-                  onSelectRow={onSelectTimelineNode}
-                />
-              </aside>
-            ) : null}
           </div>
         ) : (
           <div className="trace-detail-empty">
@@ -3733,75 +3722,6 @@ function buildDetailTabs(
   return tabs;
 }
 
-function findNodeById(
-  nodes: HierarchyNode[],
-  id: string,
-): HierarchyNode | null {
-  for (const node of nodes) {
-    if (node.id === id) {
-      return node;
-    }
-
-    const child = findNodeById(node.children, id);
-    if (child) {
-      return child;
-    }
-  }
-
-  return null;
-}
-
-function findNodePath(
-  nodes: HierarchyNode[],
-  id: string,
-  trail: HierarchyNode[] = [],
-): HierarchyNode[] {
-  for (const node of nodes) {
-    const nextTrail = [...trail, node];
-    if (node.id === id) {
-      return nextTrail;
-    }
-
-    const childTrail = findNodePath(node.children, id, nextTrail);
-    if (childTrail.length) {
-      return childTrail;
-    }
-  }
-
-  return [];
-}
-
-function getNewestTraceId(node: HierarchyNode | null): string | null {
-  if (!node?.traceIds.length) {
-    return null;
-  }
-
-  return node.traceIds[0] || null;
-}
-
-function getDefaultExpandedNodeIds(nodes: HierarchyNode[]): Set<string> {
-  const expanded = new Set<string>();
-
-  const visit = (node: HierarchyNode) => {
-    if (
-      node.children.length &&
-      (node.type === "session" || node.type === "actor")
-    ) {
-      expanded.add(node.id);
-    }
-
-    for (const child of node.children) {
-      visit(child);
-    }
-  };
-
-  for (const node of nodes) {
-    visit(node);
-  }
-
-  return expanded;
-}
-
 function getHierarchyNodeCopy(
   node: HierarchyNode,
   traceById: Map<string, TraceSummary>,
@@ -3967,62 +3887,6 @@ function formatTraceProviderSummary(
   }
 
   return formatList([trace.provider, trace.model]);
-}
-
-function groupTracesForNav(items: TraceSummary[]): Array<{
-  costUsd: number | null;
-  id: string;
-  isAggregateCost: boolean;
-  items: TraceSummary[];
-  label: string;
-  meta: string;
-}> {
-  const groups = new Map<string, TraceSummary[]>();
-  const uniqueSessions = new Set(items.map((item) => item.hierarchy.sessionId));
-  const groupMode = uniqueSessions.size > 1 ? "session" : "kind";
-
-  for (const item of items) {
-    const key =
-      groupMode === "session"
-        ? `session:${item.hierarchy.sessionId || "unknown-session"}`
-        : `kind:${item.kind}:${item.hierarchy.guardrailPhase || item.hierarchy.stage || item.mode}`;
-    const group = groups.get(key) ?? [];
-    group.push(item);
-    groups.set(key, group);
-  }
-
-  return [...groups.entries()].map(([groupKey, traces]) => {
-    const latestStartedAt = traces[0]?.startedAt ?? null;
-
-    return {
-      costUsd: sumTraceCosts(traces),
-      id: `trace-group:${groupKey}`,
-      isAggregateCost: traces.length > 1,
-      items: traces,
-      label:
-        groupMode === "session"
-          ? `Session ${shortId(traces[0]?.hierarchy.sessionId || "unknown")}`
-          : getTraceActorLabel(traces[0] as TraceSummary),
-      meta:
-        formatList([
-          latestStartedAt ? formatCompactTimestamp(latestStartedAt) : null,
-          formatCountLabel(traces.length, "trace"),
-        ]) || "No metadata",
-    };
-  });
-}
-
-function sumTraceCosts(items: TraceSummary[]): number | null {
-  const costs = items
-    .map((item) => item.costUsd)
-    .filter(
-      (value): value is number => value !== null && Number.isFinite(value),
-    );
-  if (!costs.length) {
-    return null;
-  }
-
-  return roundCostUsd(costs.reduce((sum, value) => sum + value, 0));
 }
 
 function getTraceActorLabel(
@@ -4877,10 +4741,6 @@ async function copyText(value: string): Promise<boolean> {
   } catch (_error) {
     return false;
   }
-}
-
-function toSessionNodeId(sessionId: string): string {
-  return `session:${sessionId}`;
 }
 
 function toTraceNodeId(traceId: string): string {

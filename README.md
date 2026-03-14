@@ -213,7 +213,7 @@ If usage or pricing is missing, Loupe still records the trace, but cost will sho
 
 The local dashboard includes:
 
-- `Traces` and `Sessions` navigation
+- session-first tree navigation
 - hierarchy-aware browsing
 - conversation, request, response, context, and stream views
 - formatted and raw JSON modes
