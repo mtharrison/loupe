@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 import {
   Fragment,
+  Suspense,
+  lazy,
   startTransition,
   useDeferredValue,
   useEffect,
@@ -27,8 +29,6 @@ import {
 } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import clsx from "clsx";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import {
   BRAND_MARK_PATHS,
   BRAND_MARK_VIEWBOX,
@@ -40,11 +40,19 @@ import {
   resolvePreferredTheme,
   type ThemeMode,
 } from "../../src/theme";
+import {
+  deriveSessionNavItems,
+  type SessionNavItem,
+} from "../../src/session-nav";
 
 type TraceSummary = {
   costUsd: number | null;
   durationMs: number | null;
   endedAt: string | null;
+  flags?: {
+    hasHighlights: boolean;
+    hasStructuredInput: boolean;
+  };
   hierarchy: {
     chatId: string;
     childActorId: string | null;
@@ -86,6 +94,22 @@ type HierarchyNode = {
   type: string;
 };
 
+type TraceInsights = {
+  highlights: Array<{
+    description: string;
+    kind: string;
+    snippet: string;
+    source: string;
+    title: string;
+  }>;
+  structuredInputs: Array<{
+    format: "xml";
+    role: string;
+    snippet: string;
+    tags: string[];
+  }>;
+};
+
 type TraceRecord = {
   context: Record<string, any>;
   endedAt: string | null;
@@ -112,6 +136,7 @@ type TraceRecord = {
     firstChunkMs: number | null;
     reconstructed: Record<string, any>;
   };
+  insights?: TraceInsights;
   tags: Record<string, string>;
   usage: Record<string, any> | null;
 };
@@ -137,6 +162,16 @@ const MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM = 5;
 const MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM = "9rem";
 const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM = "9rem";
 const TIMELINE_AXIS_STOPS = [0, 0.25, 0.5, 0.75, 1];
+const COMPACT_TIMELINE_AXIS_STOPS = [0, 0.5, 1];
+const EMPTY_TRACE_INSIGHTS: TraceInsights = {
+  highlights: [],
+  structuredInputs: [],
+};
+const MarkdownBlock = lazy(() =>
+  import("./markdown-block").then((module) => ({
+    default: module.MarkdownBlock,
+  })),
+);
 
 type Filters = {
   kind: string;
@@ -156,15 +191,26 @@ type TraceEventPayload = {
   type?: string;
 };
 
+type TraceFilterIntent = {
+  kind?: string;
+  status?: string;
+  tag?: [string, string];
+};
+
 type HierarchyTimelineRow = {
+  ancestorContinuations: boolean[];
   badge: string;
   costUsd: number | null;
   depth: number;
   durationMs: number;
+  hasHighlights: boolean;
+  hasStructuredInput: boolean;
+  hasVisibleChildren: boolean;
   id: string;
   isActive: boolean;
   isDetailTrace: boolean;
   isInPath: boolean;
+  isLastSibling: boolean;
   label: string;
   meta: string;
   offsetMs: number;
@@ -178,6 +224,11 @@ type HierarchyTimelineModel = {
   rows: HierarchyTimelineRow[];
   sessionLabel: string;
   startedAt: string;
+};
+
+type MessageInsightMatches = {
+  highlights: TraceInsights["highlights"];
+  structuredInputs: TraceInsights["structuredInputs"];
 };
 
 const STATUS_OPTIONS = [
@@ -229,7 +280,10 @@ export function App() {
   const [detailTab, setDetailTab] = useState<TabId>("conversation");
   const [confirmClear, setConfirmClear] = useState(false);
   const [showAdvancedFilters, setShowAdvancedFilters] = useState(false);
+  const [isSessionsPanelCollapsed, setIsSessionsPanelCollapsed] =
+    useState(false);
   const [tabModes, setTabModes] = useState<TraceTabModes>({});
+  const [allSessionCount, setAllSessionCount] = useState(0);
   const detailRequestRef = useRef(0);
   const clearConfirmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -267,15 +321,20 @@ export function App() {
     const requestVersion = dataVersionRef.current;
     const suffix = queryString ? `?${queryString}` : "";
     try {
-      const [tracesRes, hierarchyRes] = await Promise.all([
+      const [tracesRes, hierarchyRes, allHierarchyRes] = await Promise.all([
         fetch(`/api/traces${suffix}`),
         fetch(`/api/hierarchy${suffix}`),
+        queryString ? fetch("/api/hierarchy") : Promise.resolve(null),
       ]);
-      const [tracesPayload, hierarchy] = (await Promise.all([
+      const [tracesPayload, hierarchy, allHierarchy] = (await Promise.all([
         tracesRes.json(),
         hierarchyRes.json(),
-      ])) as [TraceListPayload, HierarchyPayload];
+        allHierarchyRes ? allHierarchyRes.json() : Promise.resolve(null),
+      ])) as [TraceListPayload, HierarchyPayload, HierarchyPayload | null];
       const traces = normalizeTraceListPayload(tracesPayload);
+      const nextAllSessionCount = countSessionNodes(
+        allHierarchy?.rootNodes ?? hierarchy.rootNodes,
+      );
 
       if (dataVersionRef.current !== requestVersion) {
         refreshQueuedRef.current = true;
@@ -284,6 +343,7 @@ export function App() {
 
       startTransition(() => {
         setData({ traces, hierarchy });
+        setAllSessionCount(nextAllSessionCount);
         setSelectedSessionId(
           (current) => current ?? hierarchy.rootNodes[0]?.id ?? null,
         );
@@ -425,6 +485,7 @@ export function App() {
         hierarchy: { filtered: 0, rootNodes: [], total: 0 },
         traces: { filtered: 0, items: [], total: 0 },
       });
+      setAllSessionCount(0);
       setSelectedSessionId(null);
       setSelectedNodeId(null);
       setSelectedTraceId(null);
@@ -505,12 +566,29 @@ export function App() {
     () => data.hierarchy.rootNodes.filter((node) => node.type === "session"),
     [data.hierarchy.rootNodes],
   );
+  const sessionNodeById = useMemo(
+    () => new Map(sessionNodes.map((node) => [node.id, node])),
+    [sessionNodes],
+  );
+  const sessionNavItems = useMemo(
+    () => deriveSessionNavItems(sessionNodes, traceById),
+    [sessionNodes, traceById],
+  );
+  const hasActiveFilters = Boolean(
+    filters.search || filters.status || filters.kind || filters.tags,
+  );
+  const filteredSessionCount = sessionNavItems.length;
+  const hasRecordedSessions = allSessionCount > 0;
+  const showFilteredSessionEmptyState =
+    hasActiveFilters && hasRecordedSessions && filteredSessionCount === 0;
   const selectedSessionNode = useMemo(
     () =>
       selectedSessionId
-        ? (sessionNodes.find((node) => node.id === selectedSessionId) ?? null)
-        : (sessionNodes[0] ?? null),
-    [sessionNodes, selectedSessionId],
+        ? (sessionNodeById.get(selectedSessionId) ?? null)
+        : ((sessionNavItems[0] &&
+            sessionNodeById.get(sessionNavItems[0].id)) ??
+          null),
+    [selectedSessionId, sessionNavItems, sessionNodeById],
   );
   const selectedTraceSummary = useMemo(
     () => (selectedTraceId ? (traceById.get(selectedTraceId) ?? null) : null),
@@ -520,11 +598,13 @@ export function App() {
   useEffect(() => {
     if (
       !selectedSessionId ||
-      !sessionNodes.some((node) => node.id === selectedSessionId)
+      !sessionNodeById.has(selectedSessionId)
     ) {
-      startTransition(() => setSelectedSessionId(sessionNodes[0]?.id ?? null));
+      startTransition(() =>
+        setSelectedSessionId(sessionNavItems[0]?.id ?? null),
+      );
     }
-  }, [selectedSessionId, sessionNodes]);
+  }, [selectedSessionId, sessionNavItems, sessionNodeById]);
 
   useEffect(() => {
     if (navMode !== "sessions") {
@@ -537,11 +617,10 @@ export function App() {
         : null;
     const fallbackTraceId = getNewestTraceId(selectedSessionNode);
     const fallbackNodeId =
-      currentSelectedNode?.type === "trace"
-        ? currentSelectedNode.id
-        : fallbackTraceId
-          ? toTraceNodeId(fallbackTraceId)
-          : (selectedSessionNode?.id ?? null);
+      currentSelectedNode?.id ??
+      (fallbackTraceId
+        ? toTraceNodeId(fallbackTraceId)
+        : (selectedSessionNode?.id ?? null));
     if (fallbackNodeId !== selectedNodeId) {
       startTransition(() => setSelectedNodeId(fallbackNodeId));
     }
@@ -656,9 +735,6 @@ export function App() {
   }, [selectedNodePath]);
 
   const activeTabJsonMode = tabModes[detailTab] ?? "formatted";
-  const hasActiveFilters = Boolean(
-    filters.search || filters.status || filters.kind || filters.tags,
-  );
   const activeTagFilterCount = countTagFilters(filters.tags);
 
   const onFilterChange = (key: keyof Filters, value: string) => {
@@ -675,6 +751,22 @@ export function App() {
         tags: mergeTagFilter(current.tags, nextEntry),
       }));
       setShowAdvancedFilters(true);
+    });
+  };
+
+  const applyTraceFilter = (intent: TraceFilterIntent) => {
+    startTransition(() => {
+      setFilters((current) => ({
+        ...current,
+        kind: intent.kind ?? current.kind,
+        status: intent.status ?? current.status,
+        tags: intent.tag
+          ? mergeTagFilter(current.tags, `${intent.tag[0]}:${intent.tag[1]}`)
+          : current.tags,
+      }));
+      if (intent.tag) {
+        setShowAdvancedFilters(true);
+      }
     });
   };
 
@@ -697,7 +789,9 @@ export function App() {
   };
 
   const resetFilters = () => {
-    const nextSessionNode = sessionNodes[0] ?? null;
+    const nextSessionNode =
+      (sessionNavItems[0] && sessionNodeById.get(sessionNavItems[0].id)) ??
+      null;
     startTransition(() => {
       setFilters(INITIAL_FILTERS);
       setShowAdvancedFilters(false);
@@ -742,12 +836,21 @@ export function App() {
     startTransition(() => setTheme(nextTheme));
   };
 
+  const toggleSessionsPanel = () => {
+    startTransition(() =>
+      setIsSessionsPanelCollapsed((current) => !current),
+    );
+  };
+
   const showSessionsMode = () => {
     const tracePath = selectedTraceId
       ? findNodePath(data.hierarchy.rootNodes, `trace:${selectedTraceId}`)
       : [];
     const fallbackSessionNode =
-      tracePath[0] ?? selectedSessionNode ?? sessionNodes[0] ?? null;
+      tracePath[0] ??
+      selectedSessionNode ??
+      ((sessionNavItems[0] && sessionNodeById.get(sessionNavItems[0].id)) ??
+        null);
     const fallbackNodeId =
       tracePath[tracePath.length - 1]?.id ??
       selectedNodeId ??
@@ -838,22 +941,37 @@ export function App() {
     handleHierarchySelect(node);
   };
 
+  const navigateToHierarchyNode = (nodeId: string) => {
+    const node = findNodeById(data.hierarchy.rootNodes, nodeId);
+    if (!node) {
+      return;
+    }
+
+    const nodePath = findNodePath(data.hierarchy.rootNodes, nodeId);
+    const nextSessionId =
+      nodePath[0]?.type === "session" ? nodePath[0].id : selectedSessionId;
+    const nextTraceId =
+      selectedTraceId && node.traceIds.includes(selectedTraceId)
+        ? selectedTraceId
+        : getNewestTraceId(node);
+
+    startTransition(() => {
+      setNavMode("sessions");
+      setSelectedSessionId(nextSessionId ?? null);
+      setSelectedNodeId(nodeId);
+      if (nextTraceId !== selectedTraceId) {
+        setSelectedTraceId(nextTraceId);
+      }
+    });
+  };
+
   const detailTabs = buildDetailTabs(detail);
   const activeTab = detailTabs.some((tab) => tab.id === detailTab)
     ? detailTab
     : (detailTabs[0]?.id ?? "conversation");
-  const sessionOptions = useMemo(
-    () =>
-      sessionNodes.map((node) => ({
-        label: getHierarchyNodeCopy(node, traceById).label,
-        value: node.id,
-      })),
-    [sessionNodes, traceById],
-  );
 
   const handleSessionChange = (sessionId: string) => {
-    const sessionNode =
-      sessionNodes.find((node) => node.id === sessionId) ?? null;
+    const sessionNode = sessionNodeById.get(sessionId) ?? null;
     const nextTraceId = getNewestTraceId(sessionNode);
 
     startTransition(() => {
@@ -934,6 +1052,16 @@ export function App() {
                   <Button
                     variant="outline"
                     className={cn(
+                      "session-panel-toggle",
+                      isSessionsPanelCollapsed && "is-active",
+                    )}
+                    onClick={toggleSessionsPanel}
+                  >
+                    {isSessionsPanelCollapsed ? "Show sessions" : "Hide sessions"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className={cn(
                       "tag-filter-toggle",
                       (showAdvancedFilters || activeTagFilterCount > 0) &&
                         "is-active",
@@ -972,49 +1100,51 @@ export function App() {
             </CardContent>
           </Card>
 
-          <div className="workspace-grid">
+          <div
+            className={cn(
+              "workspace-grid",
+              isSessionsPanelCollapsed && "is-sidebar-collapsed",
+            )}
+          >
             <Card className="sidebar-card session-sidebar-card inspector-card">
               <div className="session-sidebar-shell">
-                {sessionOptions.length > 1 ? (
-                  <div className="session-sidebar-toolbar">
-                    <div className="session-sidebar-toolbar-copy">
-                      <div className="session-sidebar-toolbar-title">
-                        Session
-                      </div>
-                      <div className="session-sidebar-toolbar-meta">
-                        {formatCountLabel(sessionNodes.length, "session")}
-                      </div>
-                    </div>
-                    <select
-                      className="ui-select session-sidebar-select"
-                      value={
-                        selectedSessionId ?? sessionOptions[0]?.value ?? ""
-                      }
-                      onChange={(event) =>
-                        handleSessionChange(event.target.value)
-                      }
-                    >
-                      {sessionOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                {sessionNavItems.length || hasActiveFilters || hasRecordedSessions ? (
+                  <SessionNavList
+                    hasActiveFilters={hasActiveFilters}
+                    items={sessionNavItems}
+                    onChange={handleSessionChange}
+                    totalCount={allSessionCount}
+                    selectedId={selectedSessionNode?.id ?? null}
+                  />
                 ) : null}
 
                 {selectedTimelineModel ? (
                   <HierarchyTimelineOverview
+                    axisStops={COMPACT_TIMELINE_AXIS_STOPS}
                     model={selectedTimelineModel}
                     onSelectRow={handleTimelineSelect}
                   />
                 ) : (
                   <div className="session-sidebar-empty">
-                    <EmptyState
-                      icon={Network}
-                      title="No sessions yet"
-                      description="Trigger any traced LLM call and the session timeline will appear here."
-                    />
+                    {showFilteredSessionEmptyState ? (
+                      <div className="session-sidebar-empty-state">
+                        <EmptyState
+                          icon={Filter}
+                          title="No sessions match the current filters"
+                          description="Try adjusting the search, status, kind, or tag filters to broaden the result set."
+                        />
+                        <Button variant="outline" onClick={resetFilters}>
+                          <X data-icon="inline-start" />
+                          Clear filters
+                        </Button>
+                      </div>
+                    ) : (
+                      <EmptyState
+                        icon={Network}
+                        title="No sessions yet"
+                        description="Trigger any traced LLM call and the session timeline will appear here."
+                      />
+                    )}
                   </div>
                 )}
               </div>
@@ -1029,6 +1159,8 @@ export function App() {
                   fallbackTrace={selectedTraceSummary}
                   jsonMode={activeTabJsonMode}
                   onApplyTagFilter={applyTagFilter}
+                  onApplyTraceFilter={applyTraceFilter}
+                  onNavigateHierarchyNode={navigateToHierarchyNode}
                   onTabChange={(value) => setDetailTab(value as TabId)}
                   onSelectTimelineNode={handleTimelineSelect}
                   onToggleJsonMode={(tabId) =>
@@ -1116,6 +1248,109 @@ function ThemeSwitcher({
       </button>
     </div>
   );
+}
+
+function SessionNavList({
+  hasActiveFilters,
+  items,
+  onChange,
+  selectedId,
+  totalCount,
+}: {
+  hasActiveFilters: boolean;
+  items: SessionNavItem[];
+  onChange: (sessionId: string) => void;
+  selectedId: string | null;
+  totalCount: number;
+}) {
+  const filteredCount = items.length;
+  const countLabel =
+    hasActiveFilters && totalCount > filteredCount
+      ? `${filteredCount} of ${totalCount} sessions`
+      : formatCountLabel(
+          hasActiveFilters ? filteredCount : Math.max(filteredCount, totalCount),
+          "session",
+        );
+
+  return (
+    <div className="session-nav-section">
+      <div className="session-nav-header">
+        <div className="session-nav-title-row">
+          <div className="session-nav-title">Sessions</div>
+          {hasActiveFilters ? (
+            <Badge variant="outline" className="session-nav-filter-badge">
+              Filtered
+            </Badge>
+          ) : null}
+        </div>
+        <div className="session-nav-meta">
+          {countLabel}
+        </div>
+      </div>
+      <div className="session-nav-list" role="list" aria-label="Sessions">
+        {items.map((item) => {
+          const costLabel = formatUsdCost(item.costUsd);
+          const detailLabel =
+            formatList([formatCountLabel(item.callCount, "call"), costLabel]) ||
+            formatCountLabel(item.callCount, "call");
+          const badge = getSessionNavBadge(item);
+
+          return (
+            <button
+              key={item.id}
+              type="button"
+              role="listitem"
+              className={cn(
+                "session-nav-card",
+                item.id === selectedId && "is-active",
+              )}
+              aria-pressed={item.id === selectedId}
+              onClick={() => onChange(item.id)}
+            >
+              <div className="session-nav-card-header">
+                <div
+                  className="session-nav-card-title"
+                  title={item.primaryLabel}
+                >
+                  {item.primaryLabel}
+                </div>
+                {item.latestTimestamp ? (
+                  <div className="session-nav-card-time">
+                    {item.latestTimestamp}
+                  </div>
+                ) : null}
+              </div>
+              <div className="session-nav-card-meta">{detailLabel}</div>
+              <div className="session-nav-card-footer">
+                <div className="session-nav-card-id">{item.shortSessionId}</div>
+                {badge}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function getSessionNavBadge(item: SessionNavItem): ReactNode {
+  if (item.status === "error") {
+    return <Badge variant="destructive">Error</Badge>;
+  }
+
+  if (item.status === "pending") {
+    return <Badge variant="warning">Running</Badge>;
+  }
+
+  if (item.hasHighlights) {
+    return (
+      <Badge variant="secondary" semantic="guardrail">
+        Insight
+      </Badge>
+    );
+  }
+
+  return null;
 }
 
 function BackgroundGlow() {
@@ -1388,13 +1623,27 @@ function TraceHierarchyLeaf({
   );
 }
 
-function StatusBadge({ status }: { status: TraceSummary["status"] }) {
+function StatusBadge({
+  status,
+  onClick,
+}: {
+  status: TraceSummary["status"];
+  onClick?: () => void;
+}) {
   const variant =
     status === "error"
       ? "destructive"
       : status === "pending"
         ? "warning"
         : "success";
+  if (onClick) {
+    return (
+      <BadgeButton variant={variant} onClick={onClick}>
+        {status}
+      </BadgeButton>
+    );
+  }
+
   return <Badge variant={variant}>{status}</Badge>;
 }
 
@@ -1444,17 +1693,60 @@ function TraceElapsedBar({
 }
 
 function HierarchyTimelineOverview({
+  axisStops = TIMELINE_AXIS_STOPS,
   model,
   onSelectRow,
 }: {
+  axisStops?: number[];
   model: HierarchyTimelineModel;
   onSelectRow: (nodeId: string) => void;
 }) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const hasInitializedScrollRef = useRef(false);
   const totalCostLabel = formatCostSummaryLabel(
     model.costUsd,
     model.rows.length > 1,
   );
   const hasTraceRows = model.rows.some((row) => row.type === "trace");
+  const activeRowId =
+    model.rows.find((row) => row.isActive)?.id ??
+    model.rows.find((row) => row.isDetailTrace)?.id ??
+    null;
+
+  useEffect(() => {
+    if (!activeRowId || !listRef.current) {
+      return;
+    }
+
+    if (!hasInitializedScrollRef.current) {
+      hasInitializedScrollRef.current = true;
+      return;
+    }
+
+    const list = listRef.current;
+    const target = [...list.querySelectorAll<HTMLElement>(
+      "[data-hierarchy-row-id]",
+    )].find((element) => element.dataset.hierarchyRowId === activeRowId);
+    if (!target) {
+      return;
+    }
+
+    const viewportTop = list.scrollTop;
+    const viewportBottom = viewportTop + list.clientHeight;
+    const targetTop = target.offsetTop;
+    const targetBottom = targetTop + target.offsetHeight;
+
+    if (targetTop >= viewportTop && targetBottom <= viewportBottom) {
+      return;
+    }
+
+    const contextOffset = Math.max(
+      target.offsetHeight * 1.5,
+      list.clientHeight * 0.35,
+    );
+    const nextTop = Math.max(0, targetTop - contextOffset);
+    list.scrollTo({ top: nextTop });
+  }, [activeRowId]);
 
   return (
     <div className="hierarchy-timeline-panel">
@@ -1486,7 +1778,7 @@ function HierarchyTimelineOverview({
         <div />
         <div />
         <div className="hierarchy-timeline-axis-track">
-          {TIMELINE_AXIS_STOPS.map((stop) => (
+          {axisStops.map((stop) => (
             <span
               key={stop}
               className="hierarchy-timeline-axis-tick"
@@ -1503,6 +1795,7 @@ function HierarchyTimelineOverview({
       </div>
 
       <div
+        ref={listRef}
         className="hierarchy-timeline-list"
         role="list"
         aria-label="Nested session timeline"
@@ -1536,7 +1829,44 @@ function HierarchyTimelineOverview({
                 <div
                   className="hierarchy-timeline-row-gutter"
                   aria-hidden="true"
-                />
+                >
+                  {row.ancestorContinuations.map((continues, index) => (
+                    <span
+                      key={`${row.id}-ancestor-${index}`}
+                      className={cn(
+                        "hierarchy-timeline-row-ancestor",
+                        continues && "has-line",
+                      )}
+                      style={
+                        {
+                          "--timeline-connector-index": String(index),
+                        } as CSSProperties
+                      }
+                    />
+                  ))}
+                  {row.depth > 0 ? (
+                    <span
+                      className="hierarchy-timeline-row-connector"
+                      style={
+                        {
+                          "--timeline-connector-index": String(
+                            row.depth - 1,
+                          ),
+                        } as CSSProperties
+                      }
+                    >
+                      <span className="hierarchy-timeline-row-connector-top" />
+                      <span className="hierarchy-timeline-row-connector-elbow" />
+                      <span
+                        className={cn(
+                          "hierarchy-timeline-row-connector-bottom",
+                          (row.hasVisibleChildren || !row.isLastSibling) &&
+                            "has-line",
+                        )}
+                      />
+                    </span>
+                  ) : null}
+                </div>
                 <div className="hierarchy-timeline-row-labels">
                   <div className="hierarchy-timeline-row-title">
                     <span className="hierarchy-timeline-row-title-text">
@@ -1549,6 +1879,22 @@ function HierarchyTimelineOverview({
                     >
                       {row.badge}
                     </Badge>
+                    {row.hasStructuredInput ? (
+                      <span
+                        className="hierarchy-timeline-row-flag"
+                        title="Structured input detected for this call"
+                      >
+                        Structured input
+                      </span>
+                    ) : null}
+                    {row.hasHighlights && !row.hasStructuredInput ? (
+                      <span
+                        className="hierarchy-timeline-row-flag is-highlight"
+                        title="Trace insights available"
+                      >
+                        Insight
+                      </span>
+                    ) : null}
                   </div>
                   <div className="hierarchy-timeline-row-meta">{row.meta}</div>
                 </div>
@@ -1563,16 +1909,6 @@ function HierarchyTimelineOverview({
                 <div className="hierarchy-timeline-row-duration">
                   {formatElapsedLabel(row.durationMs)}
                 </div>
-                {isTraceRow ? (
-                  <div className="hierarchy-timeline-row-action">
-                    <span
-                      className="hierarchy-timeline-row-inspect"
-                      aria-hidden="true"
-                    >
-                      Inspect
-                    </span>
-                  </div>
-                ) : null}
               </div>
             </Fragment>
           );
@@ -1586,6 +1922,7 @@ function HierarchyTimelineOverview({
                 aria-current={
                   row.isActive || row.isDetailTrace ? "true" : undefined
                 }
+                data-hierarchy-row-id={row.id}
               >
                 <button
                   type="button"
@@ -1609,6 +1946,7 @@ function HierarchyTimelineOverview({
               aria-current={
                 row.isActive || row.isDetailTrace ? "true" : undefined
               }
+              data-hierarchy-row-id={row.id}
             >
               {rowContent}
             </div>
@@ -1626,7 +1964,9 @@ function TraceDetailPanel({
   fallbackTrace,
   jsonMode,
   onApplyTagFilter,
+  onApplyTraceFilter,
   onBack,
+  onNavigateHierarchyNode,
   onSelectTimelineNode,
   onTabChange,
   onToggleJsonMode,
@@ -1638,12 +1978,16 @@ function TraceDetailPanel({
   fallbackTrace: TraceSummary | null;
   jsonMode: JsonMode;
   onApplyTagFilter: (key: string, value: string) => void;
+  onApplyTraceFilter: (intent: TraceFilterIntent) => void;
   onBack?: () => void;
+  onNavigateHierarchyNode: (nodeId: string) => void;
   onSelectTimelineNode: (nodeId: string) => void;
   onTabChange: (value: string) => void;
   onToggleJsonMode: (tabId: TabId) => void;
   timelineModel: HierarchyTimelineModel | null;
 }) {
+  const traceDetailPrimaryRef = useRef<HTMLDivElement | null>(null);
+  const [showInlineContextRail, setShowInlineContextRail] = useState(false);
   const detailCopy = detail
     ? getTraceDisplayCopy(detail)
     : fallbackTrace
@@ -1663,29 +2007,65 @@ function TraceDetailPanel({
     : (fallbackTrace?.costUsd ?? null);
   const detailCostLabel = formatUsdCost(detailCostUsd);
   const hasSecondaryInspector = Boolean(detail && timelineModel);
+  const detailFilterSource = detail ?? fallbackTrace;
+  const canInlineContextRailTab =
+    activeTab === "conversation" ||
+    activeTab === "request" ||
+    activeTab === "response";
+  const visibleDetailTabs =
+    canInlineContextRailTab && showInlineContextRail
+      ? detailTabs.filter((tab) => tab.id !== "context")
+      : detailTabs;
+  const showContextRailInPrimary =
+    showInlineContextRail &&
+    canInlineContextRailTab &&
+    jsonMode !== "raw" &&
+    Boolean(detail);
+
+  useEffect(() => {
+    const element = traceDetailPrimaryRef.current;
+    if (!element || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) {
+        return;
+      }
+
+      setShowInlineContextRail(entry.contentRect.width >= 1216);
+    });
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [detail]);
 
   return (
     <div className="trace-detail-panel" role="region" aria-label="Trace detail">
       <div className="trace-detail-header">
         <div className="trace-detail-heading">
-          {detailCopy?.pathParts?.length ? (
+          {detailCopy?.breadcrumbs?.length ? (
             <div className="trace-detail-breadcrumb" aria-label="Trace path">
-              {detailCopy.pathParts.map((part, index) => (
-                <Fragment key={`${part}-${index}`}>
+              {detailCopy.breadcrumbs.map((item, index) => (
+                <Fragment key={`${item.label}-${item.nodeId}`}>
                   {index > 0 ? (
                     <ChevronRight
                       className="trace-detail-breadcrumb-separator"
                       aria-hidden="true"
                     />
                   ) : null}
-                  <span
+                  <button
+                    type="button"
                     className={cn(
                       "trace-detail-breadcrumb-segment",
-                      index === detailCopy.pathParts.length - 1 && "is-current",
+                      index === detailCopy.breadcrumbs.length - 1 &&
+                        "is-current",
                     )}
+                    onClick={() => onNavigateHierarchyNode(item.nodeId)}
                   >
-                    {part}
-                  </span>
+                    {item.label}
+                  </button>
                 </Fragment>
               ))}
             </div>
@@ -1693,7 +2073,12 @@ function TraceDetailPanel({
           <div className="trace-detail-title-row">
             <h2>{detailCopy?.title || "Loading trace"}</h2>
             <div className="trace-detail-meta">
-              {detailStatus ? <StatusBadge status={detailStatus} /> : null}
+              {detailStatus ? (
+                <StatusBadge
+                  status={detailStatus}
+                  onClick={() => onApplyTraceFilter({ status: detailStatus })}
+                />
+              ) : null}
               {detailDuration ? (
                 <TraceMetricPill tone="latency">
                   {detailDuration}
@@ -1708,6 +2093,51 @@ function TraceDetailPanel({
             <div className="trace-detail-subtitle">{detailSubtitle}</div>
           ) : detailCopy?.path ? (
             <div className="trace-detail-subtitle">{detailCopy.path}</div>
+          ) : null}
+          {detailFilterSource ? (
+            <div className="trace-detail-filter-pills">
+              <BadgeButton
+                variant="secondary"
+                semantic={startCase(detailFilterSource.kind)}
+                onClick={() =>
+                  onApplyTraceFilter({ kind: detailFilterSource.kind })
+                }
+              >
+                {startCase(detailFilterSource.kind)}
+              </BadgeButton>
+              <BadgeButton
+                variant="outline"
+                onClick={() =>
+                  onApplyTraceFilter({ tag: ["mode", detailFilterSource.mode] })
+                }
+              >
+                {detailFilterSource.mode}
+              </BadgeButton>
+              {detailFilterSource.provider ? (
+                <BadgeButton
+                  variant="secondary"
+                  onClick={() =>
+                    onApplyTraceFilter({
+                      tag: ["provider", detailFilterSource.provider as string],
+                    })
+                  }
+                >
+                  {detailFilterSource.provider}
+                </BadgeButton>
+              ) : null}
+              {detailFilterSource.model ? (
+                <BadgeButton
+                  variant="secondary"
+                  onClick={() =>
+                    onApplyTraceFilter({
+                      tag: ["model", detailFilterSource.model as string],
+                    })
+                  }
+                >
+                  {detailFilterSource.model}
+                </BadgeButton>
+              ) : null}
+            </div>
           ) : null}
         </div>
         {onBack ? (
@@ -1729,17 +2159,19 @@ function TraceDetailPanel({
               hasSecondaryInspector && "has-secondary-inspector",
             )}
           >
-            <div className="trace-detail-primary">
+            <div className="trace-detail-primary" ref={traceDetailPrimaryRef}>
               <div className="trace-detail-toolbar">
-                <Tabs value={activeTab} onChange={onTabChange}>
-                  <TabsList className="detail-tabs">
-                    {detailTabs.map((tab) => (
-                      <TabsTrigger key={tab.id} value={tab.id}>
-                        {tab.label}
-                      </TabsTrigger>
-                    ))}
-                  </TabsList>
-                </Tabs>
+                <div className="trace-detail-tabs-shell">
+                  <Tabs value={activeTab} onChange={onTabChange}>
+                    <TabsList className="detail-tabs">
+                      {visibleDetailTabs.map((tab) => (
+                        <TabsTrigger key={tab.id} value={tab.id}>
+                          {tab.label}
+                        </TabsTrigger>
+                      ))}
+                    </TabsList>
+                  </Tabs>
+                </div>
                 <Button
                   variant="outline"
                   className="trace-detail-json-toggle"
@@ -1751,12 +2183,46 @@ function TraceDetailPanel({
               </div>
               <Separator />
               <div className="trace-detail-scroll">
-                {renderTabContent(
-                  activeTab,
-                  detail,
-                  jsonMode,
-                  onApplyTagFilter,
-                )}
+                <div className="trace-detail-pane">
+                  {showContextRailInPrimary ? (
+                    <div className="detail-inline-context-layout">
+                      <div className="detail-inline-context-main">
+                        {renderTabContent(
+                          activeTab,
+                          detail,
+                          jsonMode,
+                          onApplyTagFilter,
+                          onApplyTraceFilter,
+                        )}
+                      </div>
+                      <aside
+                        className="conversation-context-rail"
+                        aria-label="Context summary"
+                      >
+                        <div className="conversation-context-rail-header">
+                          <div className="conversation-context-rail-title">
+                            Context
+                          </div>
+                          <div className="conversation-context-rail-copy">
+                            Key trace metadata alongside the conversation.
+                          </div>
+                        </div>
+                        <ContextInspectorView
+                          detail={detail}
+                          onApplyTagFilter={onApplyTagFilter}
+                        />
+                      </aside>
+                    </div>
+                  ) : (
+                    renderTabContent(
+                      activeTab,
+                      detail,
+                      jsonMode,
+                      onApplyTagFilter,
+                      onApplyTraceFilter,
+                    )
+                  )}
+                </div>
               </div>
             </div>
 
@@ -1787,6 +2253,7 @@ function renderTabContent(
   detail: TraceRecord,
   jsonMode: JsonMode,
   onApplyTagFilter: (key: string, value: string) => void,
+  onApplyTraceFilter: (intent: TraceFilterIntent) => void,
 ) {
   const requestMessages = detail.request.input?.messages || [];
   const responseMessage = getResponseMessage(detail);
@@ -1810,7 +2277,12 @@ function renderTabContent(
         );
       }
 
-      return <ConversationView detail={detail} />;
+      return (
+        <ConversationView
+          detail={detail}
+          onApplyTraceFilter={onApplyTraceFilter}
+        />
+      );
     case "request":
       if (jsonMode === "raw") {
         return <JsonCard title="Request payload" value={detail.request} />;
@@ -1818,7 +2290,12 @@ function renderTabContent(
 
       return (
         <div className="detail-grid">
-          <MessagesCard title="Request messages" messages={requestMessages} />
+          <MessagesCard
+            insights={detail.insights}
+            title="Request messages"
+            messages={requestMessages}
+            sourcePrefix="request"
+          />
           <JsonCard title="Request options" value={detail.request.options} />
           {(detail.request.input?.tools || []).length ? (
             <JsonCard
@@ -1847,8 +2324,10 @@ function renderTabContent(
         <div className="detail-grid">
           {responseMessage ? (
             <MessagesCard
+              insights={detail.insights}
               title="Assistant message"
               messages={[responseMessage]}
+              sourcePrefix="response"
             />
           ) : null}
           {toolCalls.length ? (
@@ -1915,8 +2394,10 @@ function renderTabContent(
           <StreamTimelineCard detail={detail} />
           {detail.stream.reconstructed?.message ? (
             <MessagesCard
+              insights={detail.insights}
               title="Reconstructed output"
               messages={[detail.stream.reconstructed.message as any]}
+              sourcePrefix="stream"
             />
           ) : null}
           {detail.stream.reconstructed?.tool_calls?.length ? (
@@ -1932,7 +2413,13 @@ function renderTabContent(
   }
 }
 
-function ConversationView({ detail }: { detail: TraceRecord }) {
+function ConversationView({
+  detail,
+  onApplyTraceFilter,
+}: {
+  detail: TraceRecord;
+  onApplyTraceFilter: (intent: TraceFilterIntent) => void;
+}) {
   const requestMessages = detail.request.input?.messages || [];
   const responseMessage = getResponseMessage(detail);
   const responseToolCalls = getToolCalls(detail).filter(
@@ -1940,12 +2427,16 @@ function ConversationView({ detail }: { detail: TraceRecord }) {
   );
   const costUsd = getUsageCostUsd(detail.usage);
   const costLabel = formatUsdCost(costUsd);
+  const traceInsights = detail.insights ?? EMPTY_TRACE_INSIGHTS;
 
   return (
     <div className="conversation-layout">
       <div className="conversation-meta">
         <div className="conversation-meta-primary">
-          <StatusBadge status={detail.status} />
+          <StatusBadge
+            status={detail.status}
+            onClick={() => onApplyTraceFilter({ status: detail.status })}
+          />
           {detail.endedAt ? (
             <TraceMetricPill tone="latency">
               {Math.max(
@@ -1962,25 +2453,56 @@ function ConversationView({ detail }: { detail: TraceRecord }) {
           ) : null}
         </div>
         <div className="conversation-meta-secondary">
-          <Badge variant="secondary" semantic={startCase(detail.kind)}>
+          <BadgeButton
+            variant="secondary"
+            semantic={startCase(detail.kind)}
+            onClick={() => onApplyTraceFilter({ kind: detail.kind })}
+          >
             {startCase(detail.kind)}
-          </Badge>
-          <Badge variant="outline">{detail.mode}</Badge>
+          </BadgeButton>
+          <BadgeButton
+            variant="outline"
+            onClick={() => onApplyTraceFilter({ tag: ["mode", detail.mode] })}
+          >
+            {detail.mode}
+          </BadgeButton>
           {detail.provider ? (
-            <Badge variant="secondary">{detail.provider}</Badge>
+            <BadgeButton
+              variant="secondary"
+              onClick={() =>
+                onApplyTraceFilter({
+                  tag: ["provider", detail.provider as string],
+                })
+              }
+            >
+              {detail.provider}
+            </BadgeButton>
           ) : null}
           {detail.model ? (
-            <Badge variant="secondary">{detail.model}</Badge>
+            <BadgeButton
+              variant="secondary"
+              onClick={() =>
+                onApplyTraceFilter({ tag: ["model", detail.model as string] })
+              }
+            >
+              {detail.model}
+            </BadgeButton>
           ) : null}
         </div>
       </div>
+
+      {traceInsights.highlights.length || traceInsights.structuredInputs.length ? (
+        <TraceInsightsSummary detail={detail} insights={traceInsights} />
+      ) : null}
 
       <div className="conversation-thread">
         {requestMessages.length ? (
           requestMessages.map((message, index) => (
             <ConversationMessage
               key={`${message.role}-${index}`}
+              insights={traceInsights}
               message={message}
+              source={`request:${index}`}
             />
           ))
         ) : (
@@ -1989,10 +2511,12 @@ function ConversationView({ detail }: { detail: TraceRecord }) {
 
         {hasRenderableContent(responseMessage?.content) ? (
           <ConversationMessage
+            insights={traceInsights}
             message={{
               role: responseMessage?.role || "assistant",
               content: responseMessage?.content,
             }}
+            source="response:0"
           />
         ) : null}
 
@@ -2010,10 +2534,85 @@ function ConversationView({ detail }: { detail: TraceRecord }) {
   );
 }
 
-function ConversationMessage({
-  message,
+function TraceInsightsSummary({
+  detail,
+  insights,
 }: {
-  message: { content: any; role: string; name?: string; tool_call_id?: string };
+  detail: TraceRecord;
+  insights: TraceInsights;
+}) {
+  const title =
+    detail.kind === "guardrail" ? "Why this guardrail ran" : "Trace insights";
+  const highlights = insights.highlights.filter(
+    (item) => item.kind !== "structured-input" || !insights.structuredInputs.length,
+  );
+
+  return (
+    <Card className="detail-section trace-insights-card">
+      <CardHeader>
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>
+          Deterministic signals extracted from the trace payload.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="trace-insights-content">
+        {highlights.map((highlight, index) => (
+          <div
+            key={`${highlight.kind}-${highlight.source}-${index}`}
+            className="trace-insight-item"
+          >
+            <div className="trace-insight-item-header">
+              <Badge semantic="guardrail" variant="secondary">
+                {highlight.title}
+              </Badge>
+              <span className="trace-insight-item-source">
+                {formatInsightSource(highlight.source)}
+              </span>
+            </div>
+            <div className="trace-insight-item-copy">
+              {highlight.description}
+            </div>
+          </div>
+        ))}
+        {insights.structuredInputs.map((item, index) => (
+          <div
+            key={`${item.role}-${item.snippet}-${index}`}
+            className="trace-insight-item is-structured"
+          >
+            <div className="trace-insight-item-header">
+              <Badge semantic="guardrail" variant="secondary">
+                Structured {item.role} input
+              </Badge>
+              <div className="trace-insight-item-tags">
+                {item.tags.map((tag) => (
+                  <Badge key={tag} variant="outline">
+                    {tag}
+                  </Badge>
+                ))}
+              </div>
+            </div>
+            <div className="trace-insight-item-copy">{item.snippet}</div>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ConversationMessage({
+  insights = EMPTY_TRACE_INSIGHTS,
+  message,
+  source,
+}: {
+  insights?: TraceInsights;
+  message: {
+    content: any;
+    role: string;
+    name?: string;
+    tool_call_id?: string;
+    tool_calls?: any[];
+  };
+  source: string;
 }) {
   const toolCalls = getMessageToolCalls(message);
 
@@ -2028,10 +2627,20 @@ function ConversationMessage({
   }
 
   if (toolCalls.length) {
+    const messageInsights = getMessageInsightMatches(
+      insights,
+      source,
+      message.role,
+      message.content,
+    );
     return (
       <Fragment>
         {hasRenderableContent(message.content) ? (
-          <ConversationBubble role={message.role} content={message.content} />
+          <ConversationBubble
+            role={message.role}
+            content={message.content}
+            insights={messageInsights}
+          />
         ) : null}
         {toolCalls.map((toolCall, index) => (
           <ToolCallBubble
@@ -2050,10 +2659,31 @@ function ConversationMessage({
     return null;
   }
 
-  return <ConversationBubble role={message.role} content={message.content} />;
+  const messageInsights = getMessageInsightMatches(
+    insights,
+    source,
+    message.role,
+    message.content,
+  );
+
+  return (
+    <ConversationBubble
+      content={message.content}
+      insights={messageInsights}
+      role={message.role}
+    />
+  );
 }
 
-function ConversationBubble({ content, role }: { content: any; role: string }) {
+function ConversationBubble({
+  content,
+  insights,
+  role,
+}: {
+  content: any;
+  insights: MessageInsightMatches;
+  role: string;
+}) {
   const tone =
     role === "user"
       ? "is-user"
@@ -2065,6 +2695,9 @@ function ConversationBubble({ content, role }: { content: any; role: string }) {
     <div className={clsx("conversation-row", tone)}>
       <div className="conversation-role">{role}</div>
       <div className="conversation-bubble">
+        {insights.structuredInputs.length || insights.highlights.length ? (
+          <MessageInsightBanner insights={insights} />
+        ) : null}
         <RichMessageContent content={content} role={role} />
       </div>
     </div>
@@ -2118,6 +2751,84 @@ function ToolCallBubble({ index, toolCall }: { index: number; toolCall: any }) {
   );
 }
 
+function MessageInsightBanner({
+  insights,
+}: {
+  insights: MessageInsightMatches;
+}) {
+  return (
+    <div className="message-insight-banner">
+      {insights.structuredInputs.map((item, index) => (
+        <div
+          key={`${item.role}-${item.snippet}-${index}`}
+          className="message-insight-card"
+        >
+          <div className="message-insight-card-header">
+            <Badge semantic="guardrail" variant="secondary">
+              Structured input
+            </Badge>
+            <div className="message-insight-card-tags">
+              {item.tags.slice(0, 3).map((tag) => (
+                <Badge key={tag} variant="outline">
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          </div>
+          <div className="message-insight-card-copy">
+            XML-like markup detected in this {item.role} message.
+          </div>
+        </div>
+      ))}
+      {insights.highlights.map((highlight, index) => (
+        <div
+          key={`${highlight.kind}-${highlight.source}-${index}`}
+          className="message-insight-card is-highlight"
+        >
+          <div className="message-insight-card-header">
+            <Badge semantic="guardrail" variant="secondary">
+              {highlight.title}
+            </Badge>
+          </div>
+          <div className="message-insight-card-copy">
+            {highlight.description}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function getMessageInsightMatches(
+  insights: TraceInsights,
+  source: string,
+  role: string,
+  content: any,
+): MessageInsightMatches {
+  const text = extractPlainMessageText(content);
+  const normalizedText = text ? text.replace(/\s+/g, " ") : null;
+  const structuredInputs = insights.structuredInputs.filter(
+    (item) =>
+      item.role === role &&
+      normalizedText !== null &&
+      normalizedText.includes(item.snippet.replace(/\.\.\.$/, "")),
+  );
+
+  return {
+    highlights: insights.highlights.filter(
+      (highlight) =>
+        !(highlight.kind === "structured-input" && structuredInputs.length) &&
+        (
+          highlight.source === source ||
+          (normalizedText !== null &&
+            highlight.snippet.length > 0 &&
+            normalizedText.includes(highlight.snippet.replace(/\.\.\.$/, "")))
+        ),
+    ),
+    structuredInputs,
+  };
+}
+
 function RichMessageContent({
   content,
   role,
@@ -2125,11 +2836,30 @@ function RichMessageContent({
   content: any;
   role?: string;
 }) {
-  const jsonValue = detectJsonValue(content);
-  const markdown = jsonValue === null ? toMarkdownText(content) : null;
-  const collapseText = getMessageCollapseText(content, jsonValue, markdown);
-  const canCollapse = shouldCollapseMessage(collapseText, role);
-  const isStructured = jsonValue !== null || markdown === null;
+  const jsonValue = useMemo(() => detectJsonValue(content), [content]);
+  const markdown = useMemo(
+    () => (jsonValue === null ? toMarkdownText(content) : null),
+    [content, jsonValue],
+  );
+  const structuredMarkup = useMemo(
+    () =>
+      jsonValue === null && markdown !== null
+        ? detectStructuredMarkup(markdown)
+        : null,
+    [jsonValue, markdown],
+  );
+  const collapseText = useMemo(
+    () => getMessageCollapseText(content, jsonValue, markdown),
+    [content, jsonValue, markdown],
+  );
+  const canCollapse = useMemo(
+    () => shouldCollapseMessage(collapseText, role),
+    [collapseText, role],
+  );
+  const isStructured = useMemo(
+    () => jsonValue !== null || markdown === null || structuredMarkup !== null,
+    [jsonValue, markdown, structuredMarkup],
+  );
   const collapsedHeight =
     role === "system"
       ? isStructured
@@ -2145,19 +2875,30 @@ function RichMessageContent({
     setExpanded(false);
   }, [collapseText]);
 
-  let renderedContent: ReactNode;
+  const renderedContent = useMemo<ReactNode>(() => {
+    if (jsonValue !== null) {
+      return <PrettyJson value={jsonValue} />;
+    }
 
-  if (jsonValue !== null) {
-    renderedContent = <PrettyJson value={jsonValue} />;
-  } else if (markdown !== null) {
-    renderedContent = (
-      <ReactMarkdown className="markdown-body" remarkPlugins={[remarkGfm]}>
-        {markdown}
-      </ReactMarkdown>
-    );
-  } else {
-    renderedContent = <pre>{JSON.stringify(content, null, 2)}</pre>;
-  }
+    if (structuredMarkup !== null && markdown !== null) {
+      return (
+        <StructuredMarkupBlock
+          markup={structuredMarkup}
+          text={markdown}
+        />
+      );
+    }
+
+    if (markdown !== null) {
+      return (
+        <Suspense fallback={<pre>{markdown}</pre>}>
+          <MarkdownBlock markdown={markdown} />
+        </Suspense>
+      );
+    }
+
+    return <pre>{JSON.stringify(content, null, 2)}</pre>;
+  }, [content, jsonValue, markdown, structuredMarkup]);
 
   if (!canCollapse) {
     return renderedContent;
@@ -2175,10 +2916,49 @@ function RichMessageContent({
   );
 }
 
+function StructuredMarkupBlock({
+  markup,
+  text,
+}: {
+  markup: { tags: string[]; tokens: Array<{ type: string; value: string }> };
+  text: string;
+}) {
+  return (
+    <div className="structured-markup-block">
+      <div className="structured-markup-header">
+        <Badge semantic="guardrail" variant="secondary">
+          Structured input
+        </Badge>
+        <div className="structured-markup-tags">
+          {markup.tags.map((tag) => (
+            <Badge key={tag} variant="outline">
+              {tag}
+            </Badge>
+          ))}
+        </div>
+      </div>
+      <pre className="structured-markup-pre" aria-label="Structured message">
+        {markup.tokens.length
+          ? markup.tokens.map((token, index) => (
+              <span
+                key={`${token.type}-${index}`}
+                className={`structured-markup-token is-${token.type}`}
+              >
+                {token.value}
+              </span>
+            ))
+          : text}
+      </pre>
+    </div>
+  );
+}
+
 function PrettyJson({ value }: { value: any }) {
-  const json =
-    value === undefined ? "undefined" : JSON.stringify(value, null, 2);
-  const tokens = tokenizeJson(json);
+  const json = useMemo(
+    () => (value === undefined ? "undefined" : JSON.stringify(value, null, 2)),
+    [value],
+  );
+  const tokens = useMemo(() => tokenizeJson(json), [json]);
 
   return (
     <div className="json-frame">
@@ -2611,10 +3391,14 @@ function MetadataActionButton({
 }
 
 function MessagesCard({
+  insights = EMPTY_TRACE_INSIGHTS,
   messages,
+  sourcePrefix,
   title,
 }: {
+  insights?: TraceInsights;
   messages: Array<{ content: any; role: string }>;
+  sourcePrefix: "request" | "response" | "stream";
   title: string;
 }) {
   return (
@@ -2627,7 +3411,9 @@ function MessagesCard({
           messages.map((message, index) => (
             <StructuredMessageCard
               key={`${message.role}-${index}`}
+              insights={insights}
               message={message}
+              source={`${sourcePrefix}:${index}`}
             />
           ))
         ) : (
@@ -2658,8 +3444,11 @@ function ToolCallsCard({
 }
 
 function StructuredMessageCard({
+  insights = EMPTY_TRACE_INSIGHTS,
   message,
+  source,
 }: {
+  insights?: TraceInsights;
   message: {
     content: any;
     name?: string;
@@ -2667,11 +3456,18 @@ function StructuredMessageCard({
     tool_call_id?: string;
     tool_calls?: any[];
   };
+  source: string;
 }) {
   const toolCalls = getMessageToolCalls(message);
   const hasContent = hasRenderableContent(message.content);
   const isToolCallTurn = toolCalls.length > 0;
   const isToolResult = message.role === "tool";
+  const messageInsights = getMessageInsightMatches(
+    insights,
+    source,
+    message.role,
+    message.content,
+  );
 
   return (
     <div className={cn("message-card", `role-${message.role}`)}>
@@ -2694,6 +3490,9 @@ function StructuredMessageCard({
         </div>
       </div>
       <div className="message-card-body">
+        {messageInsights.structuredInputs.length || messageInsights.highlights.length ? (
+          <MessageInsightBanner insights={messageInsights} />
+        ) : null}
         {hasContent ? (
           <RichMessageContent content={message.content} role={message.role} />
         ) : isToolCallTurn ? (
@@ -3094,46 +3893,66 @@ function getTraceDisplayCopy(
     "hierarchy" | "kind" | "mode" | "model" | "provider"
   >,
 ): {
+  breadcrumbs: Array<{ label: string; nodeId: string }>;
   path: string;
-  pathParts: string[];
   subtitle: string;
   title: string;
 } {
   const actor = trace.hierarchy.childActorId || trace.hierarchy.rootActorId;
-  const pathParts = getTracePathParts(trace);
+  const breadcrumbs = getTraceBreadcrumbs(trace);
+  const pathParts = breadcrumbs.map((item) => item.label);
 
   return {
+    breadcrumbs,
     path: pathParts.join(" / "),
-    pathParts,
     subtitle: formatList([actor, trace.provider, trace.model]),
     title: getTraceTitle(trace),
   };
 }
 
-function getTracePathParts(
+function getTraceBreadcrumbs(
   trace: Pick<TraceSummary, "hierarchy" | "kind">,
-): string[] {
-  const pathParts = [
-    `Session ${shortId(trace.hierarchy.sessionId)}`,
-    trace.hierarchy.rootActorId,
+): Array<{ label: string; nodeId: string }> {
+  const sessionId = trace.hierarchy.sessionId || "unknown-session";
+  const rootActorId = trace.hierarchy.rootActorId || "unknown-actor";
+  const breadcrumbs = [
+    {
+      label: `Session ${shortId(sessionId)}`,
+      nodeId: `session:${sessionId}`,
+    },
+    {
+      label: rootActorId,
+      nodeId: `actor:${sessionId}:${rootActorId}`,
+    },
   ];
 
   if (trace.kind === "guardrail") {
-    pathParts.push(
-      `${capitalize(trace.hierarchy.guardrailPhase || "guardrail")} guardrail`,
-    );
+    const label = `${capitalize(trace.hierarchy.guardrailPhase || "guardrail")} guardrail`;
+    breadcrumbs.push({
+      label,
+      nodeId: `guardrail:${sessionId}:${rootActorId}:${trace.hierarchy.guardrailType || label.toLowerCase()}`,
+    });
   } else if (trace.kind === "child-actor" && trace.hierarchy.childActorId) {
-    pathParts.push(`Child actor: ${trace.hierarchy.childActorId}`);
+    breadcrumbs.push({
+      label: `Child actor: ${trace.hierarchy.childActorId}`,
+      nodeId: `child-actor:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId}`,
+    });
   } else if (trace.kind === "stage") {
     if (trace.hierarchy.childActorId) {
-      pathParts.push(`Child actor: ${trace.hierarchy.childActorId}`);
+      breadcrumbs.push({
+        label: `Child actor: ${trace.hierarchy.childActorId}`,
+        nodeId: `child-actor:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId}`,
+      });
     }
     if (trace.hierarchy.stage) {
-      pathParts.push(`Stage: ${trace.hierarchy.stage}`);
+      breadcrumbs.push({
+        label: `Stage: ${trace.hierarchy.stage}`,
+        nodeId: `stage:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId || "root"}:${trace.hierarchy.stage}`,
+      });
     }
   }
 
-  return pathParts;
+  return breadcrumbs;
 }
 
 function formatTraceProviderSummary(
@@ -3257,6 +4076,10 @@ function toTraceSummary(trace: TraceRecord): TraceSummary {
       ? Math.max(0, Date.parse(trace.endedAt) - Date.parse(trace.startedAt))
       : null,
     endedAt: trace.endedAt,
+    flags: {
+      hasHighlights: Boolean(trace.insights?.highlights?.length),
+      hasStructuredInput: Boolean(trace.insights?.structuredInputs?.length),
+    },
     hierarchy: structuredClone(trace.hierarchy),
     id: trace.id,
     kind: trace.kind,
@@ -3298,6 +4121,10 @@ function normalizeTraceSummary(summary: TraceSummary): TraceSummary {
       Number.isFinite(summary.durationMs)
         ? summary.durationMs
         : null,
+    flags: {
+      hasHighlights: Boolean(summary.flags?.hasHighlights),
+      hasStructuredInput: Boolean(summary.flags?.hasStructuredInput),
+    },
     stream: summary.stream
       ? {
           chunkCount:
@@ -3536,22 +4363,39 @@ function buildHierarchyTimelineModel(
   const pathIds = new Set(selectedNodePath.map((node) => node.id));
   const rows: HierarchyTimelineRow[] = [];
 
-  const visit = (node: HierarchyNode, depth: number) => {
+  const visit = (
+    node: HierarchyNode,
+    depth: number,
+    ancestorContinuations: boolean[],
+    isLastSibling: boolean,
+  ) => {
     const timing = getTiming(node);
     if (!timing) {
       return;
     }
 
     const copy = getHierarchyNodeCopy(node, traceById);
+    const trace =
+      node.type === "trace" && node.meta.traceId
+        ? (traceById.get(node.meta.traceId) ?? null)
+        : null;
+    const children = node.children
+      .slice()
+      .sort((left, right) => compareHierarchyNodesForTimeline(left, right, getTiming));
     rows.push({
+      ancestorContinuations,
       badge: copy.badge,
       costUsd: getHierarchyNodeCostUsd(node),
       depth,
       durationMs: timing.durationMs,
+      hasHighlights: Boolean(trace?.flags?.hasHighlights),
+      hasStructuredInput: Boolean(trace?.flags?.hasStructuredInput),
+      hasVisibleChildren: children.length > 0,
       id: node.id,
       isActive: node.id === selectedNodeId,
       isDetailTrace: node.meta?.traceId === selectedTraceId,
       isInPath: pathIds.has(node.id),
+      isLastSibling,
       label: copy.label,
       meta: copy.meta,
       offsetMs: Math.max(0, timing.startMs - rootTiming.startMs),
@@ -3559,28 +4403,17 @@ function buildHierarchyTimelineModel(
       type: node.type,
     });
 
-    for (const child of node.children) {
-      visit(child, depth + 1);
+    for (const [index, child] of children.entries()) {
+      visit(
+        child,
+        depth + 1,
+        [...ancestorContinuations, !isLastSibling],
+        index === children.length - 1,
+      );
     }
   };
 
-  visit(rootNode, 0);
-
-  rows.sort((left, right) => {
-    if (left.offsetMs !== right.offsetMs) {
-      return left.offsetMs - right.offsetMs;
-    }
-
-    if (left.depth !== right.depth) {
-      return left.depth - right.depth;
-    }
-
-    if (left.durationMs !== right.durationMs) {
-      return right.durationMs - left.durationMs;
-    }
-
-    return left.label.localeCompare(right.label);
-  });
+  visit(rootNode, 0, [], true);
 
   return {
     costUsd: getHierarchyNodeCostUsd(rootNode),
@@ -3589,6 +4422,30 @@ function buildHierarchyTimelineModel(
     sessionLabel: getHierarchyNodeCopy(rootNode, traceById).label,
     startedAt: rootTiming.startedAt,
   };
+}
+
+function compareHierarchyNodesForTimeline(
+  left: HierarchyNode,
+  right: HierarchyNode,
+  getTiming: (node: HierarchyNode) => {
+    durationMs: number;
+    endMs: number;
+    startMs: number;
+    startedAt: string;
+  } | null,
+): number {
+  const leftTiming = getTiming(left);
+  const rightTiming = getTiming(right);
+
+  if (leftTiming && rightTiming && leftTiming.startMs !== rightTiming.startMs) {
+    return leftTiming.startMs - rightTiming.startMs;
+  }
+
+  if (left.type !== right.type) {
+    return left.type.localeCompare(right.type);
+  }
+
+  return left.label.localeCompare(right.label);
 }
 
 function resolveHierarchyNodeTiming(
@@ -3685,12 +4542,38 @@ function getTimelineTypeLabel(type: string): string {
   }
 }
 
+function formatInsightSource(source: string): string {
+  if (source.startsWith("request:")) {
+    return `Request ${Number(source.split(":")[1] || 0) + 1}`;
+  }
+
+  if (source.startsWith("response:")) {
+    return "Response";
+  }
+
+  if (source.startsWith("stream:")) {
+    return "Stream";
+  }
+
+  if (source === "trace:guardrail") {
+    return "Guardrail context";
+  }
+
+  return source;
+}
+
 function buildHierarchyTimelineRowTooltip(row: HierarchyTimelineRow): string {
   const parts = [
     `${row.label} (${getTimelineTypeLabel(row.type)})`,
     `Started ${formatTimelineTimestamp(row.startedAt)}`,
     `Duration ${formatElapsedLabel(row.durationMs)}`,
   ];
+
+  if (row.hasStructuredInput) {
+    parts.push("Structured input detected");
+  } else if (row.hasHighlights) {
+    parts.push("Trace insights available");
+  }
 
   if (row.costUsd !== null) {
     parts.push(`Cost ${formatUsdCost(row.costUsd)}`);
@@ -3745,6 +4628,10 @@ function countTagFilters(value: string): number {
     .filter(Boolean).length;
 }
 
+function countSessionNodes(nodes: HierarchyNode[]): number {
+  return nodes.filter((node) => node.type === "session").length;
+}
+
 function getHierarchyNodeCostUsd(
   node: HierarchyNode | null | undefined,
 ): number | null {
@@ -3790,18 +4677,18 @@ function formatUsdCost(costUsd: number | null | undefined): string | null {
   }
 
   if (costUsd > 0 && costUsd < 0.0001) {
-    return "<$0.0001";
+    return "<US$0.0001";
   }
 
   if (costUsd >= 10) {
-    return `$${costUsd.toFixed(2)}`;
+    return `US$${costUsd.toFixed(2)}`;
   }
 
   if (costUsd >= 1) {
-    return `$${costUsd.toFixed(3)}`;
+    return `US$${costUsd.toFixed(3)}`;
   }
 
-  return `$${costUsd.toFixed(4)}`;
+  return `US$${costUsd.toFixed(4)}`;
 }
 
 function formatCostSummaryLabel(
@@ -3883,7 +4770,7 @@ function createCurrencyMetadataEntry(
     label,
     monospace: false,
     secondary,
-    value: formatUsdCost(rawValue) ?? "$0.0000",
+    value: formatUsdCost(rawValue) ?? "US$0.0000",
   };
 }
 
@@ -3908,14 +4795,14 @@ function formatPricingRate(value: unknown): string | undefined {
   }
 
   if (numeric >= 0.01) {
-    return `$${numeric.toFixed(4)} / token`;
+    return `US$${numeric.toFixed(4)} / token`;
   }
 
   if (numeric >= 0.0001) {
-    return `$${numeric.toFixed(6)} / token`;
+    return `US$${numeric.toFixed(6)} / token`;
   }
 
-  return `$${numeric.toExponential(2)} / token`;
+  return `US$${numeric.toExponential(2)} / token`;
 }
 
 function formatTimestampDetails(value: string): {
@@ -4373,6 +5260,113 @@ function toMarkdownText(content: any): string | null {
   return null;
 }
 
+function extractPlainMessageText(content: any): string | null {
+  const markdown = toMarkdownText(content);
+  if (markdown !== null) {
+    return markdown;
+  }
+
+  if (typeof content === "string") {
+    return content;
+  }
+
+  return null;
+}
+
+function detectStructuredMarkup(
+  text: string,
+): { tags: string[]; tokens: Array<{ type: string; value: string }> } | null {
+  const tagRegex = /<\/?([A-Za-z][\w:-]*)\b[^>]*>/g;
+  const tagNames = [...text.matchAll(tagRegex)].map((match) =>
+    match[1].toLowerCase(),
+  );
+  const tags = [...new Set(tagNames)].slice(0, 6);
+
+  if (!tags.length) {
+    return null;
+  }
+
+  const hasInstructionalTag = tags.some((tag) =>
+    [
+      "assistant",
+      "instruction",
+      "option",
+      "policy",
+      "system",
+      "user",
+    ].includes(tag),
+  );
+  const hasMultipleTags = tags.length >= 2;
+  const hasClosingTag = /<\/[A-Za-z][\w:-]*>/.test(text);
+
+  if (!hasClosingTag && !hasInstructionalTag && !hasMultipleTags) {
+    return null;
+  }
+
+  return {
+    tags: tags.slice(0, 4),
+    tokens: tokenizeStructuredMarkup(text),
+  };
+}
+
+function tokenizeStructuredMarkup(
+  text: string,
+): Array<{ type: string; value: string }> {
+  const parts = text.split(/(<\/?[\w:-]+\b[^>]*\/?>)/g).filter(Boolean);
+  const tokens: Array<{ type: string; value: string }> = [];
+
+  for (const part of parts) {
+    if (!part.startsWith("<")) {
+      tokens.push({ type: "text", value: part });
+      continue;
+    }
+
+    const tagMatch = part.match(/^(<\/?)([\w:-]+)(.*?)(\/?>)$/s);
+    if (!tagMatch) {
+      tokens.push({ type: "tag-punctuation", value: part });
+      continue;
+    }
+
+    const [, open, tagName, attributesPart, close] = tagMatch;
+    tokens.push({ type: "tag-punctuation", value: open });
+    tokens.push({ type: "tag-name", value: tagName });
+
+    const attrRegex = /(\s+)([\w:-]+)(\s*=\s*)?(".*?"|'.*?'|[^\s"'=<>`]+)?/gs;
+    let lastIndex = 0;
+    let attrMatch = attrRegex.exec(attributesPart);
+    while (attrMatch) {
+      const [full, leadingSpace, attrName, separator = "", attrValue = ""] =
+        attrMatch;
+      if (attrMatch.index > lastIndex) {
+        tokens.push({
+          type: "text",
+          value: attributesPart.slice(lastIndex, attrMatch.index),
+        });
+      }
+      tokens.push({ type: "text", value: leadingSpace });
+      tokens.push({ type: "attr-name", value: attrName });
+      if (separator) {
+        tokens.push({ type: "attr-punctuation", value: separator });
+      }
+      if (attrValue) {
+        tokens.push({ type: "attr-value", value: attrValue });
+      }
+      lastIndex = attrMatch.index + full.length;
+      attrMatch = attrRegex.exec(attributesPart);
+    }
+    if (lastIndex < attributesPart.length) {
+      tokens.push({
+        type: "text",
+        value: attributesPart.slice(lastIndex),
+      });
+    }
+
+    tokens.push({ type: "tag-punctuation", value: close });
+  }
+
+  return tokens;
+}
+
 function getMessageCollapseText(
   content: any,
   jsonValue: any,
@@ -4668,6 +5662,40 @@ function Badge({
     >
       {children}
     </span>
+  );
+}
+
+function BadgeButton({
+  children,
+  className,
+  onClick,
+  semantic,
+  title,
+  variant = "secondary",
+}: {
+  children: ReactNode;
+  className?: string;
+  onClick: () => void;
+  semantic?: string;
+  title?: string;
+  variant?: "destructive" | "outline" | "secondary" | "success" | "warning";
+}) {
+  const semanticValue = semantic?.toLowerCase();
+  return (
+    <button
+      type="button"
+      className={cn(
+        "ui-badge",
+        `ui-badge-${variant}`,
+        "ui-badge-button",
+        className,
+      )}
+      data-semantic={semanticValue ?? undefined}
+      onClick={onClick}
+      title={title}
+    >
+      {children}
+    </button>
   );
 }
 

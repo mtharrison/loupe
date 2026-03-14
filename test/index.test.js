@@ -16,6 +16,7 @@ const {
   startTraceServer,
   wrapChatModel,
 } = require('../dist/index.js');
+const { deriveSessionNavItems } = require('../dist/session-nav.js');
 
 let nextPort = 4500;
 
@@ -184,6 +185,145 @@ test('legacy context aliases still normalize into the generic hierarchy model', 
   assert.equal(trace.hierarchy.rootActorId, 'root-agent');
 });
 
+test('derived insights surface structured input and guardrail context', async () => {
+  const tracer = getLocalLLMTracer({ maxTraces: 10 });
+  tracer.store.clear();
+
+  const traceId = tracer.recordInvokeStart(
+    {
+      sessionId: 'session-insights',
+      rootSessionId: 'session-insights',
+      rootActorId: 'translator',
+      actorId: 'output-guardrail',
+      guardrailPhase: 'output',
+      guardrailType: 'outputPolicyCheck',
+      systemType: 'outputPolicyCheck',
+      model: 'gpt-4.1',
+      provider: 'openai',
+    },
+    {
+      input: {
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a translation assistant. '.repeat(80),
+          },
+          {
+            role: 'user',
+            content:
+              '<user><instruction priority="high">Translate carefully.</instruction><option tone="formal">Formal</option></user>',
+          },
+        ],
+      },
+      options: {},
+    },
+  );
+  tracer.recordInvokeFinish(traceId, {
+    message: { role: 'assistant', content: 'Translated.' },
+    tool_calls: [],
+    usage: {},
+  });
+
+  const trace = tracer.store.get(traceId);
+  assert.ok(trace);
+  assert.ok(trace.insights);
+  assert.equal(trace.insights.structuredInputs.length, 1);
+  assert.deepEqual(trace.insights.structuredInputs[0].tags.slice(0, 3), ['user', 'instruction', 'option']);
+  assert.ok(trace.insights.highlights.some((item) => item.kind === 'structured-input'));
+  assert.ok(trace.insights.highlights.some((item) => item.kind === 'long-message'));
+  assert.ok(trace.insights.highlights.some((item) => item.kind === 'guardrail-context'));
+
+  const summary = tracer.store.list().items[0];
+  assert.deepEqual(summary.flags, {
+    hasHighlights: true,
+    hasStructuredInput: true,
+  });
+});
+
+test('session nav items sort by latest activity and aggregate status metadata', async () => {
+  const sessionNodes = [
+    {
+      children: [{ children: [], count: 2, id: 'actor:globalDefault', meta: { actorId: 'globalDefault' }, traceIds: ['trace-ok', 'trace-pending'], type: 'actor' }],
+      count: 2,
+      id: 'session:b8cf8aa5-newest',
+      meta: { costUsd: 0.0072, sessionId: 'b8cf8aa5-newest' },
+      traceIds: ['trace-ok', 'trace-pending'],
+      type: 'session',
+    },
+    {
+      children: [{ children: [], count: 1, id: 'actor:reviewer', meta: { actorId: 'reviewer' }, traceIds: ['trace-error'], type: 'actor' }],
+      count: 1,
+      id: 'session:d1e2f3a4-error',
+      meta: { costUsd: 0.0025, sessionId: 'd1e2f3a4-error' },
+      traceIds: ['trace-error'],
+      type: 'session',
+    },
+    {
+      children: [],
+      count: 1,
+      id: 'session:e9f0a1b2-missing',
+      meta: { costUsd: 0.0011, sessionId: 'e9f0a1b2-missing' },
+      traceIds: ['trace-missing'],
+      type: 'session',
+    },
+  ];
+  const traceById = new Map([
+    [
+      'trace-ok',
+      {
+        costUsd: 0.003,
+        flags: { hasHighlights: false },
+        hierarchy: { rootActorId: 'globalDefault', sessionId: 'b8cf8aa5-newest' },
+        id: 'trace-ok',
+        startedAt: '2026-03-14T08:44:00.000Z',
+        status: 'ok',
+      },
+    ],
+    [
+      'trace-pending',
+      {
+        costUsd: 0.0042,
+        flags: { hasHighlights: true },
+        hierarchy: { rootActorId: 'globalDefault', sessionId: 'b8cf8aa5-newest' },
+        id: 'trace-pending',
+        startedAt: '2026-03-14T08:46:00.000Z',
+        status: 'pending',
+      },
+    ],
+    [
+      'trace-error',
+      {
+        costUsd: 0.0025,
+        flags: { hasHighlights: false },
+        hierarchy: { rootActorId: 'reviewer', sessionId: 'd1e2f3a4-error' },
+        id: 'trace-error',
+        startedAt: '2026-03-14T08:45:00.000Z',
+        status: 'error',
+      },
+    ],
+  ]);
+
+  const items = deriveSessionNavItems(sessionNodes, traceById);
+
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ['session:b8cf8aa5-newest', 'session:d1e2f3a4-error', 'session:e9f0a1b2-missing'],
+  );
+  assert.equal(items[0].primaryLabel, 'globalDefault');
+  assert.equal(items[0].status, 'pending');
+  assert.equal(items[0].hasHighlights, true);
+  assert.equal(items[0].callCount, 2);
+  assert.equal(items[0].costUsd, 0.0072);
+  assert.equal(items[0].shortSessionId, 'b8cf8aa5');
+  assert.ok(items[0].latestTimestamp);
+
+  assert.equal(items[1].status, 'error');
+  assert.equal(items[1].primaryLabel, 'reviewer');
+
+  assert.equal(items[2].primaryLabel, 'e9f0a1b2');
+  assert.equal(items[2].shortSessionId, 'e9f0a1b2');
+});
+
 test('SSE emits trace lifecycle events', async () => {
   process.env.LLM_TRACE_ENABLED = '1';
   process.env.LLM_TRACE_PORT = String(reservePort());
@@ -219,6 +359,7 @@ test('SSE emits trace lifecycle events', async () => {
 
   assert.ok(chunks.join('').includes('"type":"trace:add"'));
   assert.ok(chunks.join('').includes('"type":"trace:update"'));
+  assert.ok(chunks.join('').includes('"insights"'));
 });
 
 test('SSE emits UI reload events', async () => {

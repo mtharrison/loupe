@@ -86,6 +86,31 @@ export type TraceRequest = {
   options?: Record<string, any>;
 };
 
+export type TraceStructuredInputInsight = {
+  format: 'xml';
+  role: string;
+  snippet: string;
+  tags: string[];
+};
+
+export type TraceHighlightInsight = {
+  description: string;
+  kind: string;
+  snippet: string;
+  source: string;
+  title: string;
+};
+
+export type TraceInsights = {
+  highlights: TraceHighlightInsight[];
+  structuredInputs: TraceStructuredInputInsight[];
+};
+
+export type TraceSummaryFlags = {
+  hasHighlights: boolean;
+  hasStructuredInput: boolean;
+};
+
 export type TraceRecord = {
   context: NormalizedTraceContext;
   endedAt: string | null;
@@ -113,6 +138,7 @@ export type TraceRecord = {
       usage: Record<string, any> | null;
     };
   };
+  insights?: TraceInsights;
   tags: TraceTags;
   usage: Record<string, any> | null;
 };
@@ -121,6 +147,7 @@ export type TraceSummary = {
   costUsd: number | null;
   durationMs: number | null;
   endedAt: string | null;
+  flags?: TraceSummaryFlags;
   hierarchy: TraceHierarchy;
   id: string;
   kind: string;

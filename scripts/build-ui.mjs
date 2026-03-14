@@ -21,7 +21,7 @@ await build({
   loader: {
     '.svg': 'dataurl',
   },
-  splitting: false,
+  splitting: true,
   minify: false,
   sourcemap: false,
   logLevel: 'info',

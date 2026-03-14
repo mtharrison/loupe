@@ -20,7 +20,7 @@ function createBuildOptions() {
     loader: {
       '.svg': 'dataurl' as const,
     },
-    splitting: false,
+    splitting: true,
     minify: false,
     sourcemap: false,
     logLevel: 'silent' as const,

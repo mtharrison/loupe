@@ -10,7 +10,7 @@ import {
   type TraceRequest,
   type TraceSummary,
 } from './types';
-import { getUsageCostUsd, normalizeTraceContext, safeClone, sanitizeHeaders, toErrorPayload, toSummary } from './utils';
+import { getTraceInsights, getUsageCostUsd, normalizeTraceContext, safeClone, sanitizeHeaders, toErrorPayload, toSummary } from './utils';
 
 type MutableHierarchyNode = Omit<HierarchyNode, 'children'> & {
   children: Map<string, MutableHierarchyNode>;
@@ -287,7 +287,10 @@ export class TraceStore extends EventEmitter {
   }
 
   private cloneTrace(trace: TraceRecord): TraceRecord {
-    return safeClone(trace);
+    return {
+      ...safeClone(trace),
+      insights: getTraceInsights(trace),
+    };
   }
 
   private filteredTraces(filters: TraceFilters = {}): TraceRecord[] {
