@@ -34,8 +34,6 @@ import {
   BRAND_MARK_VIEWBOX,
   BRAND_NAME,
   BRAND_SUBTITLE,
-  BRAND_WORDMARK_PATHS,
-  BRAND_WORDMARK_VIEWBOX,
 } from "../../src/brand";
 import {
   applyTheme,
@@ -1078,15 +1076,9 @@ function BrandLogo() {
 function BrandWordmark() {
   return (
     <div className="brand-wordmark" role="img" aria-label={BRAND_NAME}>
-      <svg
-        viewBox={BRAND_WORDMARK_VIEWBOX}
-        className="brand-wordmark-svg"
-        aria-hidden="true"
-      >
-        {BRAND_WORDMARK_PATHS.map((path, index) => (
-          <path key={index} d={path} fill="currentColor" />
-        ))}
-      </svg>
+      <span className="brand-wordmark-text" aria-hidden="true">
+        {BRAND_NAME}
+      </span>
     </div>
   );
 }

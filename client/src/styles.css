@@ -1,3 +1,5 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap");
+
 :root {
   color-scheme: light;
   --background: #9aaec4;
@@ -18,6 +20,7 @@
   --shadow: 0 22px 60px rgba(30, 48, 72, 0.16);
   --radius: 22px;
   --page-gutter: 1.5rem;
+  --brand-font: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
 }
 
 :root[data-theme="dark"] {
@@ -255,10 +258,13 @@ pre {
   color: #132e48;
 }
 
-.brand-wordmark-svg {
+.brand-wordmark-text {
   display: block;
-  width: clamp(8rem, 13vw, 10.15rem);
-  height: auto;
+  font-family: var(--brand-font);
+  font-size: clamp(1.65rem, 2.5vw, 2.15rem);
+  font-weight: 700;
+  letter-spacing: -0.06em;
+  line-height: 0.95;
 }
 
 .brand-subtitle {
