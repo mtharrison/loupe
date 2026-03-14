@@ -20,6 +20,16 @@ Most tracing tools assume hosted infrastructure, persistent storage, or producti
 - cost rollups when token usage and pricing are available
 - zero external services
 
+## Screenshots
+
+Conversation view with tool calls, staged traces, and session navigation:
+
+![Loupe conversation view](./assets/screenshot1.png)
+
+Request view showing the captured OpenAI payload for a multi-turn tool call:
+
+![Loupe request view](./assets/screenshot2.png)
+
 ## Installation
 
 ```sh
@@ -37,6 +47,87 @@ Enable tracing:
 ```bash
 export LLM_TRACE_ENABLED=1
 ```
+
+If your app already uses a higher-level model interface or the official OpenAI client, Loupe can wrap that directly instead of requiring manual `record*` calls.
+
+### `wrapOpenAIClient(client, getContext, config?)`
+
+Wraps `client.chat.completions.create(...)` on an OpenAI-compatible client and records either an `invoke` trace or a `stream` trace based on `params.stream`.
+
+```ts
+import {
+  wrapOpenAIClient,
+} from '@mtharrison/loupe';
+import OpenAI from 'openai';
+
+const client = wrapOpenAIClient(
+  new OpenAI(),
+  () => ({
+    sessionId: 'session-123',
+    rootActorId: 'support-assistant',
+    actorId: 'support-assistant',
+  }),
+);
+
+const completion = await client.chat.completions.create({
+  model: 'gpt-4.1',
+  messages: [{ role: 'user', content: 'Summarize the latest notes.' }],
+});
+
+const stream = await client.chat.completions.create({
+  model: 'gpt-4.1',
+  messages: [{ role: 'user', content: 'Stream the same summary.' }],
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices?.[0]?.delta?.content || '');
+}
+```
+
+If you do not call `startServer()` yourself, the dashboard starts lazily on the first recorded trace.
+
+When the server starts, Loupe prints the local URL:
+
+```text
+[llm-trace] dashboard: http://127.0.0.1:4319
+```
+
+If `4319` is already in use and you did not explicitly configure a port, Loupe falls back to another free local port and prints that URL instead.
+
+`wrapOpenAIClient()` is structurally typed, so Loupe's runtime API does not require the OpenAI SDK for normal library usage. The repo includes `openai` as a dev dependency for the bundled demo; if your own app instantiates `new OpenAI()` or runs the published example from a consumer install, install `openai` there too.
+
+### `wrapChatModel(model, getContext, config?)`
+
+Wraps any object with `invoke()` and `stream()` methods.
+
+### Runnable OpenAI Tools Demo
+
+There is also a runnable example at `examples/openai-multiturn-tools.js` that:
+
+- starts the Loupe dashboard eagerly
+- wraps an OpenAI client with `wrapOpenAIClient()`
+- runs a multi-turn conversation with tool calls
+- keeps the process alive so the in-memory traces stay visible in the dashboard
+
+From this repo, after installing this package's dev dependencies, run:
+
+```bash
+npm install
+export OPENAI_API_KEY=your-key
+export LLM_TRACE_ENABLED=1
+node examples/openai-multiturn-tools.js
+```
+
+If you copy this example pattern into another app, install `openai` in that app before using `new OpenAI()`.
+
+Supported demo environment variables: `OPENAI_MODEL`, `LLM_TRACE_PORT`, `LOUPE_OPEN_BROWSER`.
+
+The script tries to open the dashboard automatically and prints the local URL either way. Set `LOUPE_OPEN_BROWSER=0` if you want to suppress the browser launch.
+
+## Low-Level Lifecycle API
+
+If you need full control over trace boundaries, Loupe also exposes the lower-level `record*` lifecycle functions.
 
 Start the dashboard during app startup, then instrument a model call:
 
@@ -87,15 +178,7 @@ try {
 }
 ```
 
-If you do not call `startServer()` yourself, the dashboard starts lazily on the first recorded trace.
-
-When the server starts, Loupe prints the local URL:
-
-```text
-[llm-trace] dashboard: http://127.0.0.1:4319
-```
-
-## Streaming
+### Streaming
 
 Streaming works the same way. Loupe records each chunk event, first-chunk latency, and the reconstructed final response.
 
@@ -231,7 +314,7 @@ Environment variables:
 | --- | --- | --- |
 | `LLM_TRACE_ENABLED` | `false` | Enables Loupe. |
 | `LLM_TRACE_HOST` | `127.0.0.1` | Host for the local dashboard server. |
-| `LLM_TRACE_PORT` | `4319` | Port for the local dashboard server. |
+| `LLM_TRACE_PORT` | `4319` | Port for the local dashboard server. If unset, Loupe tries `4319` first and falls back to a free local port if it is already in use. |
 | `LLM_TRACE_MAX_TRACES` | `1000` | Maximum number of traces kept in memory. |
 | `LLM_TRACE_UI_HOT_RELOAD` | auto in local interactive dev | Enables UI rebuild + reload while developing the dashboard itself. |
 
@@ -239,7 +322,7 @@ Programmatic configuration is also available through `getLocalLLMTracer(config)`
 
 ## API
 
-The supported public API is the low-level tracer lifecycle API.
+Loupe exposes both low-level lifecycle functions and lightweight wrappers.
 
 ### `isTraceEnabled()`
 
@@ -282,6 +365,14 @@ Stores the final stream payload and marks the trace complete.
 Marks a trace as failed and stores a serialized error payload.
 
 All of these functions forward to the singleton tracer returned by `getLocalLLMTracer()`.
+
+### `wrapChatModel(model, getContext, config?)`
+
+Returns a traced model wrapper for `invoke()` and `stream()`.
+
+### `wrapOpenAIClient(client, getContext, config?)`
+
+Returns a traced OpenAI client wrapper for `chat.completions.create(...)`.
 
 ## HTTP Endpoints
 

@@ -15,6 +15,7 @@ const {
   recordStreamStart,
   startTraceServer,
   wrapChatModel,
+  wrapOpenAIClient,
 } = require('../dist/index.js');
 const {
   deriveSessionNavItems,
@@ -22,12 +23,31 @@ const {
   resolveSessionTreeSelection,
   sortSessionNodesForNav,
 } = require('../dist/session-nav.js');
+const { createTraceServer } = require('../dist/server.js');
+const { TraceStore } = require('../dist/store.js');
 
 let nextPort = 4500;
 
 function reservePort() {
   nextPort += 1;
   return nextPort;
+}
+
+async function listenOnPort(port, host = '127.0.0.1') {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200);
+    res.end('ok');
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+
+  return server;
 }
 
 function buildSessionTreeFixture() {
@@ -535,6 +555,27 @@ test('SSE emits UI reload events', async () => {
   assert.ok(chunks.join('').includes('"type":"ui:reload"'));
 });
 
+test('createTraceServer falls back to a free port when the preferred default port is occupied', async () => {
+  const blockedPort = reservePort();
+  const blocker = await listenOnPort(blockedPort);
+  const server = createTraceServer(new TraceStore(), {
+    allowPortFallback: true,
+    host: '127.0.0.1',
+    port: blockedPort,
+  });
+
+  try {
+    const info = await server.start();
+    assert.ok(info);
+    assert.equal(info.host, '127.0.0.1');
+    assert.notEqual(info.port, blockedPort);
+    assert.match(info.url, new RegExp(`^http://127\\.0\\.0\\.1:${info.port}$`));
+  } finally {
+    server.close();
+    await new Promise((resolve) => blocker.close(resolve));
+  }
+});
+
 test('wrapChatModel records invoke and stream traces', async () => {
   process.env.LLM_TRACE_ENABLED = '1';
   process.env.LLM_TRACE_PORT = String(reservePort());
@@ -581,4 +622,172 @@ test('wrapChatModel records invoke and stream traces', async () => {
   assert.equal(traces[1].mode, 'invoke');
   assert.equal(traces[0].costUsd, 0.3);
   assert.equal(traces[1].costUsd, 0.3);
+});
+
+test('wrapOpenAIClient records chat.completions invoke traces', async () => {
+  process.env.LLM_TRACE_ENABLED = '1';
+  process.env.LLM_TRACE_PORT = String(reservePort());
+  const port = Number(process.env.LLM_TRACE_PORT);
+
+  const tracer = getLocalLLMTracer({ maxTraces: 10, port });
+  tracer.store.clear();
+
+  const client = wrapOpenAIClient(
+    {
+      chat: {
+        completions: {
+          async create(params) {
+            return {
+              id: 'chatcmpl-invoke',
+              model: params.model,
+              object: 'chat.completion',
+              choices: [
+                {
+                  finish_reason: 'stop',
+                  message: {
+                    role: 'assistant',
+                    content: `echo:${params.messages[0].content}`,
+                  },
+                },
+              ],
+              usage: {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+              },
+            };
+          },
+        },
+        ping() {
+          return 'pong';
+        },
+      },
+    },
+    () => ({ sessionId: 'openai-invoke', rootActorId: 'root', actorId: 'root' }),
+    { port },
+  );
+
+  assert.equal(client.chat.ping(), 'pong');
+
+  const response = await client.chat.completions.create(
+    {
+      model: 'gpt-4.1',
+      messages: [{ role: 'user', content: 'hello invoke' }],
+    },
+    {
+      headers: {
+        authorization: 'Bearer secret',
+        'x-trace-id': 'trace-123',
+      },
+    },
+  );
+
+  assert.equal(response.choices[0].message.content, 'echo:hello invoke');
+
+  const traces = tracer.store.list().items;
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0].mode, 'invoke');
+  assert.equal(traces[0].provider, 'openai');
+  assert.equal(traces[0].model, 'gpt-4.1');
+
+  const trace = tracer.store.get(traces[0].id);
+  assert.equal(trace.request.options.headers.authorization, '[REDACTED]');
+  assert.equal(trace.request.options.headers['x-trace-id'], 'trace-123');
+  assert.equal(trace.response.message.content, 'echo:hello invoke');
+  assert.equal(trace.usage.tokens.prompt, 3);
+  assert.equal(trace.usage.tokens.completion, 4);
+  assert.equal(trace.response.raw.id, 'chatcmpl-invoke');
+});
+
+test('wrapOpenAIClient records chat.completions stream traces', async () => {
+  process.env.LLM_TRACE_ENABLED = '1';
+  process.env.LLM_TRACE_PORT = String(reservePort());
+  const port = Number(process.env.LLM_TRACE_PORT);
+
+  const tracer = getLocalLLMTracer({ maxTraces: 10, port });
+  tracer.store.clear();
+
+  const client = wrapOpenAIClient(
+    {
+      chat: {
+        completions: {
+          async create() {
+            return {
+              toReadableStream() {
+                return 'readable';
+              },
+              async *[Symbol.asyncIterator]() {
+                yield {
+                  id: 'chatcmpl-stream-1',
+                  choices: [
+                    {
+                      delta: { role: 'assistant' },
+                      finish_reason: null,
+                      index: 0,
+                    },
+                  ],
+                };
+                yield {
+                  id: 'chatcmpl-stream-2',
+                  choices: [
+                    {
+                      delta: { content: 'hello ' },
+                      finish_reason: null,
+                      index: 0,
+                    },
+                  ],
+                };
+                yield {
+                  id: 'chatcmpl-stream-3',
+                  choices: [
+                    {
+                      delta: { content: 'world' },
+                      finish_reason: 'stop',
+                      index: 0,
+                    },
+                  ],
+                  usage: {
+                    prompt_tokens: 5,
+                    completion_tokens: 2,
+                    total_tokens: 7,
+                  },
+                };
+              },
+            };
+          },
+        },
+      },
+    },
+    () => ({ sessionId: 'openai-stream', rootActorId: 'root', actorId: 'root' }),
+    { port },
+  );
+
+  const stream = await client.chat.completions.create({
+    model: 'gpt-4.1-mini',
+    messages: [{ role: 'user', content: 'hello stream' }],
+    stream: true,
+  });
+
+  assert.equal(stream.toReadableStream(), 'readable');
+
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+
+  assert.equal(chunks.length, 3);
+
+  const traces = tracer.store.list().items;
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0].mode, 'stream');
+  assert.equal(traces[0].provider, 'openai');
+  assert.equal(traces[0].model, 'gpt-4.1-mini');
+  assert.equal(traces[0].responsePreview, 'hello world');
+
+  const trace = tracer.store.get(traces[0].id);
+  assert.equal(trace.stream.reconstructed.message.role, 'assistant');
+  assert.equal(trace.stream.reconstructed.message.content, 'hello world');
+  assert.equal(trace.usage.tokens.prompt, 5);
+  assert.equal(trace.usage.tokens.completion, 2);
+  assert.equal(trace.response.type, 'finish');
 });

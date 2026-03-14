@@ -1,4 +1,4 @@
-import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { URL } from 'node:url';
@@ -6,14 +6,15 @@ import { renderAppHtml } from './ui';
 import { type TraceEvent, type TraceFilters, type TraceServer, type UIReloadEvent } from './types';
 import { TraceStore } from './store';
 
-export function createTraceServer(store: TraceStore, options: { host?: string; port?: number } = {}): TraceServer {
+export function createTraceServer(store: TraceStore, options: { allowPortFallback?: boolean; host?: string; port?: number } = {}): TraceServer {
   const host = options.host || '127.0.0.1';
-  const port = Number(options.port) || 4319;
+  const requestedPort = toPortNumber(options.port, 4319);
+  let activePort = requestedPort;
   const clients = new Set<ServerResponse>();
 
   const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
-      const url = new URL(req.url || '/', `http://${req.headers.host || `${host}:${port}`}`);
+      const url = new URL(req.url || '/', `http://${req.headers.host || `${host}:${activePort}`}`);
 
       if (req.method === 'GET' && url.pathname === '/') {
         sendHtml(res, renderAppHtml());
@@ -70,20 +71,15 @@ export function createTraceServer(store: TraceStore, options: { host?: string; p
 
   return {
     async start() {
-      await new Promise<void>((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, host, () => {
-          server.removeListener('error', reject);
-          resolve();
-        });
-      });
+      await listenWithFallback(server, host, requestedPort, options.allowPortFallback);
+      activePort = getBoundPort(server, requestedPort);
 
       server.unref();
 
       return {
         host,
-        port,
-        url: `http://${host}:${port}`,
+        port: activePort,
+        url: `http://${host}:${activePort}`,
       };
     },
     broadcast,
@@ -102,6 +98,51 @@ export function createTraceServer(store: TraceStore, options: { host?: string; p
       client.write(payload);
     }
   }
+}
+
+async function listenWithFallback(server: Server, host: string, port: number, allowPortFallback = false) {
+  await new Promise<void>((resolve, reject) => {
+    const tryListen = (nextPort: number, canFallback: boolean) => {
+      const onError = (error: NodeJS.ErrnoException) => {
+        server.removeListener('listening', onListening);
+
+        if (canFallback && error?.code === 'EADDRINUSE') {
+          tryListen(0, false);
+          return;
+        }
+
+        reject(error);
+      };
+
+      const onListening = () => {
+        server.removeListener('error', onError);
+        resolve();
+      };
+
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(nextPort, host);
+    };
+
+    tryListen(port, allowPortFallback);
+  });
+}
+
+function getBoundPort(server: Server, fallbackPort: number): number {
+  const address = server.address();
+  if (address && typeof address === 'object' && typeof address.port === 'number') {
+    return address.port;
+  }
+
+  return fallbackPort;
+}
+
+function toPortNumber(value: number | undefined, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  return fallback;
 }
 
 function parseFilters(url: URL): TraceFilters {

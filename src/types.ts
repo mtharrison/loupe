@@ -218,6 +218,41 @@ export interface ChatModelLike<TInput = any, TOptions = any, TValue = any, TChun
   stream(input: TInput, options?: TOptions): AsyncGenerator<TChunk>;
 }
 
+export type OpenAIChatCompletionCreateParamsLike = Record<string, any> & {
+  messages?: Record<string, any>[];
+  model?: string | null;
+  stream?: boolean | null;
+};
+
+export interface OpenAIChatCompletionStreamLike<TChunk = any> extends AsyncIterable<TChunk> {
+  [Symbol.asyncIterator](): AsyncIterator<TChunk>;
+}
+
+export interface OpenAIChatCompletionsLike<
+  TParams = OpenAIChatCompletionCreateParamsLike,
+  TOptions = Record<string, any>,
+  TResponse = any,
+  TChunk = any,
+> {
+  create(
+    params: TParams,
+    options?: TOptions,
+  ): Promise<TResponse> | Promise<OpenAIChatCompletionStreamLike<TChunk>> | OpenAIChatCompletionStreamLike<TChunk>;
+}
+
+export interface OpenAIClientLike<
+  TParams = OpenAIChatCompletionCreateParamsLike,
+  TOptions = Record<string, any>,
+  TResponse = any,
+  TChunk = any,
+> {
+  chat: {
+    completions: OpenAIChatCompletionsLike<TParams, TOptions, TResponse, TChunk>;
+    [key: string]: any;
+  };
+  [key: string]: any;
+}
+
 export type TraceServer = {
   broadcast(event: TraceEvent | UIReloadEvent): void;
   close(): void;

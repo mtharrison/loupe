@@ -18,6 +18,7 @@
   "files": [
     "dist",
     "assets",
+    "examples",
     "README.md",
     "LICENSE"
   ],
@@ -48,6 +49,7 @@
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "openai": "^6.29.0",
     "typescript": "^5.9.2"
   },
   "keywords": [
