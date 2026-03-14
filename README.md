@@ -22,7 +22,7 @@ Most tracing tools assume hosted infrastructure, persistent storage, or producti
 
 ## Installation
 
-```bash
+```sh
 npm install @mtharrison/loupe
 ```
 
