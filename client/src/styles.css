@@ -715,6 +715,26 @@ pre {
   --semantic-badge-color: rgba(61, 108, 225, 0.9);
 }
 
+.ui-badge[data-semantic="system"] {
+  --semantic-badge-color: rgba(40, 93, 168, 0.92);
+}
+
+.ui-badge[data-semantic="assistant"] {
+  --semantic-badge-color: rgba(91, 108, 168, 0.88);
+}
+
+.ui-badge[data-semantic="user"] {
+  --semantic-badge-color: rgba(46, 181, 129, 0.92);
+}
+
+.ui-badge[data-semantic="tool"] {
+  --semantic-badge-color: rgba(59, 146, 111, 0.9);
+}
+
+.ui-badge[data-semantic="tool-call"] {
+  --semantic-badge-color: rgba(219, 150, 58, 0.92);
+}
+
 .ui-badge-outline {
   border: 1px solid rgba(40, 93, 168, 0.16);
   background: rgba(40, 93, 168, 0.08);
@@ -2230,6 +2250,13 @@ pre {
 }
 
 .conversation-row {
+  --message-accent: rgba(120, 137, 159, 0.24);
+  --message-border-color: rgba(88, 105, 130, 0.12);
+  --message-surface: rgba(255, 255, 255, 0.92);
+  --message-label-color: color-mix(in srgb, var(--foreground) 52%, var(--muted-foreground));
+  --message-label-border: rgba(88, 105, 130, 0.12);
+  --message-label-surface: rgba(88, 105, 130, 0.06);
+  --message-role-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62);
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
@@ -2238,6 +2265,12 @@ pre {
 
 .conversation-row.is-user {
   align-self: flex-end;
+  --message-accent: rgba(46, 181, 129, 0.58);
+  --message-border-color: rgba(46, 181, 129, 0.28);
+  --message-surface: rgba(232, 251, 242, 0.98);
+  --message-label-color: #178b61;
+  --message-label-border: rgba(46, 181, 129, 0.26);
+  --message-label-surface: rgba(46, 181, 129, 0.16);
 }
 
 .conversation-row.is-assistant,
@@ -2247,57 +2280,98 @@ pre {
   align-self: flex-start;
 }
 
+.conversation-row.is-assistant {
+  --message-accent: rgba(151, 96, 255, 0.48);
+  --message-border-color: rgba(151, 96, 255, 0.24);
+  --message-surface: rgba(247, 240, 255, 0.98);
+  --message-label-color: #7a41e3;
+  --message-label-border: rgba(151, 96, 255, 0.24);
+  --message-label-surface: rgba(151, 96, 255, 0.16);
+}
+
+.conversation-row.is-system {
+  --message-accent: rgba(46, 104, 255, 0.56);
+  --message-border-color: rgba(46, 104, 255, 0.28);
+  --message-surface: rgba(233, 240, 255, 0.98);
+  --message-label-color: #245fd6;
+  --message-label-border: rgba(46, 104, 255, 0.24);
+  --message-label-surface: rgba(46, 104, 255, 0.16);
+}
+
+.conversation-row.is-tool {
+  --message-accent: rgba(23, 171, 108, 0.52);
+  --message-border-color: rgba(23, 171, 108, 0.25);
+  --message-surface: rgba(231, 251, 240, 0.98);
+  --message-label-color: #0f8a58;
+  --message-label-border: rgba(23, 171, 108, 0.24);
+  --message-label-surface: rgba(23, 171, 108, 0.16);
+}
+
+.conversation-row.is-tool-call {
+  --message-accent: rgba(255, 153, 28, 0.56);
+  --message-border-color: rgba(255, 153, 28, 0.28);
+  --message-surface: rgba(255, 244, 227, 0.98);
+  --message-label-color: #b96b00;
+  --message-label-border: rgba(255, 153, 28, 0.24);
+  --message-label-surface: rgba(255, 153, 28, 0.16);
+}
+
 .conversation-role {
-  color: var(--muted-foreground);
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid var(--message-label-border);
+  border-radius: 999px;
+  background: var(--message-label-surface);
+  box-shadow: var(--message-role-shadow);
+  color: var(--message-label-color);
   font-size: 0.74rem;
   font-weight: 700;
   letter-spacing: 0.06em;
+  padding: 0.28rem 0.55rem;
   text-transform: uppercase;
 }
 
 .conversation-bubble {
   --expandable-fade-color: rgba(255, 255, 255, 0.96);
-  border: 1px solid var(--line);
+  border: 1px solid var(--message-border-color);
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.9);
+  background: var(--message-surface);
   padding: 0.9rem 1rem;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  box-shadow:
+    inset 3px 0 0 var(--message-accent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.conversation-row.is-user .conversation-role {
+  align-self: flex-end;
 }
 
 .conversation-row.is-user .conversation-bubble {
-  --expandable-fade-color: rgba(224, 236, 248, 0.96);
-  background: rgba(224, 236, 248, 0.88);
+  --expandable-fade-color: rgba(232, 251, 242, 0.98);
 }
 
 .conversation-row.is-assistant .conversation-bubble {
   --expandable-fade-color: rgba(255, 255, 255, 0.98);
-  background: rgba(255, 255, 255, 0.96);
-}
-
-.conversation-row.is-system .conversation-role {
-  color: var(--primary);
 }
 
 .conversation-row.is-system .conversation-bubble {
   --expandable-fade-color: rgba(235, 242, 250, 0.98);
-  border-color: rgba(40, 93, 168, 0.16);
-  background: rgba(235, 242, 250, 0.94);
-  box-shadow: inset 3px 0 0 rgba(40, 93, 168, 0.4);
 }
 
 .tool-result-bubble {
-  --expandable-fade-color: rgba(245, 248, 251, 0.98);
+  --expandable-fade-color: rgba(238, 248, 243, 0.98);
   display: flex;
   flex-direction: column;
   gap: 0.8rem;
-  background: rgba(245, 248, 251, 0.94);
 }
 
 .tool-call-bubble {
+  --expandable-fade-color: rgba(252, 245, 232, 0.98);
   display: flex;
   flex-direction: column;
   gap: 0.8rem;
-  background: rgba(237, 243, 249, 0.96);
 }
 
 .tool-result-meta {
@@ -2668,14 +2742,20 @@ pre {
 }
 
 .message-card {
+  --message-accent: rgba(120, 137, 159, 0.22);
+  --message-border-color: rgba(88, 105, 130, 0.1);
+  --message-surface: rgba(255, 255, 255, 0.92);
   --expandable-fade-color: rgba(255, 255, 255, 0.98);
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
   padding: 0.9rem;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.92);
-  border: 1px solid rgba(88, 105, 130, 0.08);
+  background: var(--message-surface);
+  border: 1px solid var(--message-border-color);
+  box-shadow:
+    inset 3px 0 0 var(--message-accent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.68);
 }
 
 .message-card-header {
@@ -2706,24 +2786,31 @@ pre {
 }
 
 .message-card.role-system {
+  --message-accent: rgba(46, 104, 255, 0.56);
+  --message-border-color: rgba(46, 104, 255, 0.24);
+  --message-surface: rgba(233, 240, 255, 0.98);
   --expandable-fade-color: rgba(236, 242, 250, 0.98);
-  border-color: rgba(40, 93, 168, 0.14);
-  background: rgba(236, 242, 250, 0.94);
 }
 
 .message-card.role-assistant {
+  --message-accent: rgba(151, 96, 255, 0.48);
+  --message-border-color: rgba(151, 96, 255, 0.2);
+  --message-surface: rgba(247, 240, 255, 0.98);
   --expandable-fade-color: rgba(255, 255, 255, 0.98);
-  background: rgba(255, 255, 255, 0.96);
 }
 
 .message-card.role-user {
-  --expandable-fade-color: rgba(227, 237, 248, 0.96);
-  background: rgba(227, 237, 248, 0.82);
+  --message-accent: rgba(46, 181, 129, 0.58);
+  --message-border-color: rgba(46, 181, 129, 0.24);
+  --message-surface: rgba(232, 251, 242, 0.97);
+  --expandable-fade-color: rgba(232, 251, 242, 0.98);
 }
 
 .message-card.role-tool {
-  --expandable-fade-color: rgba(243, 247, 251, 0.98);
-  background: rgba(243, 247, 251, 0.94);
+  --message-accent: rgba(23, 171, 108, 0.52);
+  --message-border-color: rgba(23, 171, 108, 0.22);
+  --message-surface: rgba(231, 251, 240, 0.97);
+  --expandable-fade-color: rgba(238, 248, 243, 0.98);
 }
 
 .tool-call-stack {
@@ -3348,33 +3435,71 @@ pre {
   box-shadow: -24px 0 70px rgba(1, 7, 18, 0.42);
 }
 
+:root[data-theme="dark"] .conversation-row,
+:root[data-theme="dark"] .message-card {
+  --message-role-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
 :root[data-theme="dark"] .conversation-row.is-user .conversation-bubble,
 :root[data-theme="dark"] .message-card.role-user {
-  --expandable-fade-color: rgba(33, 47, 69, 0.98);
-  background: rgba(33, 47, 69, 0.96);
+  --message-accent: rgba(76, 218, 157, 0.58);
+  --message-border-color: rgba(76, 218, 157, 0.28);
+  --message-surface: rgba(10, 72, 49, 0.98);
+  --message-label-color: rgba(209, 255, 234, 0.98);
+  --message-label-border: rgba(76, 218, 157, 0.24);
+  --message-label-surface: rgba(76, 218, 157, 0.18);
+  --expandable-fade-color: rgba(10, 72, 49, 0.99);
 }
 
 :root[data-theme="dark"] .conversation-row.is-assistant .conversation-bubble,
 :root[data-theme="dark"] .message-card.role-assistant {
+  --message-accent: rgba(177, 108, 255, 0.54);
+  --message-border-color: rgba(177, 108, 255, 0.24);
+  --message-surface: rgba(54, 24, 89, 0.98);
+  --message-label-color: rgba(231, 208, 255, 0.98);
+  --message-label-border: rgba(177, 108, 255, 0.22);
+  --message-label-surface: rgba(177, 108, 255, 0.16);
   --expandable-fade-color: rgba(22, 32, 48, 0.99);
-  background: rgba(22, 32, 48, 0.98);
 }
 
 :root[data-theme="dark"] .conversation-row.is-system .conversation-bubble,
 :root[data-theme="dark"] .message-card.role-system {
+  --message-accent: rgba(79, 136, 255, 0.62);
+  --message-border-color: rgba(79, 136, 255, 0.28);
+  --message-surface: rgba(17, 42, 96, 0.98);
+  --message-label-color: rgba(203, 221, 255, 0.98);
+  --message-label-border: rgba(79, 136, 255, 0.26);
+  --message-label-surface: rgba(79, 136, 255, 0.18);
   --expandable-fade-color: rgba(26, 39, 57, 0.99);
-  border-color: rgba(134, 184, 255, 0.24);
-  background: rgba(26, 39, 57, 0.98);
-  box-shadow: inset 3px 0 0 rgba(134, 184, 255, 0.42);
+}
+
+:root[data-theme="dark"] .conversation-row.is-tool .conversation-bubble,
+:root[data-theme="dark"] .message-card.role-tool {
+  --message-accent: rgba(60, 212, 144, 0.56);
+  --message-border-color: rgba(60, 212, 144, 0.26);
+  --message-surface: rgba(11, 63, 42, 0.98);
+  --message-label-color: rgba(203, 255, 229, 0.98);
+  --message-label-border: rgba(60, 212, 144, 0.22);
+  --message-label-surface: rgba(60, 212, 144, 0.16);
+  --expandable-fade-color: rgba(18, 34, 33, 0.99);
+}
+
+:root[data-theme="dark"] .conversation-row.is-tool-call .conversation-bubble {
+  --message-accent: rgba(255, 170, 66, 0.6);
+  --message-border-color: rgba(255, 170, 66, 0.28);
+  --message-surface: rgba(84, 43, 5, 0.98);
+  --message-label-color: rgba(255, 228, 184, 0.98);
+  --message-label-border: rgba(255, 170, 66, 0.24);
+  --message-label-surface: rgba(255, 170, 66, 0.16);
+  --expandable-fade-color: rgba(44, 31, 16, 0.99);
 }
 
 :root[data-theme="dark"] .tool-result-bubble {
-  --expandable-fade-color: rgba(17, 26, 39, 0.99);
-  background: rgba(17, 26, 39, 0.96);
+  --expandable-fade-color: rgba(18, 34, 33, 0.99);
 }
 
 :root[data-theme="dark"] .tool-call-bubble {
-  background: rgba(20, 32, 48, 0.98);
+  --expandable-fade-color: rgba(44, 31, 16, 0.99);
 }
 
 :root[data-theme="dark"] .markdown-body code {

@@ -2684,7 +2684,9 @@ function StructuredMessageCard({
   return (
     <div className={cn("message-card", `role-${message.role}`)}>
       <div className="message-card-header">
-        <Badge variant="secondary">{message.role}</Badge>
+        <Badge semantic={message.role} variant="secondary">
+          {message.role}
+        </Badge>
         <div className="message-card-header-meta">
           {isToolResult && message.name ? (
             <Badge variant="outline">{message.name}</Badge>
@@ -2693,7 +2695,7 @@ function StructuredMessageCard({
             <Badge variant="secondary">{message.tool_call_id}</Badge>
           ) : null}
           {isToolCallTurn ? (
-            <Badge variant="outline">
+            <Badge semantic="tool-call" variant="outline">
               {formatCountLabel(toolCalls.length, "tool call")}
             </Badge>
           ) : null}
@@ -4543,6 +4545,17 @@ function getSemanticBadgeValue(
       return "session";
     case "actor":
       return "actor";
+    case "assistant":
+      return "assistant";
+    case "user":
+      return "user";
+    case "system":
+      return "system";
+    case "tool":
+      return "tool";
+    case "tool call":
+    case "tool-call":
+      return "tool-call";
     case "guardrail":
       return "guardrail";
     case "call":
