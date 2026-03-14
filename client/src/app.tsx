@@ -134,6 +134,10 @@ const MESSAGE_COLLAPSE_CHAR_LIMIT = 900;
 const MESSAGE_COLLAPSE_LINE_LIMIT = 12;
 const MESSAGE_COLLAPSE_HEIGHT_PROSE = "6.5rem";
 const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED = "10.75rem";
+const MESSAGE_COLLAPSE_CHAR_LIMIT_SYSTEM = 320;
+const MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM = 4;
+const MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM = "4.6rem";
+const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM = "7rem";
 const TIMELINE_AXIS_STOPS = [0, 0.25, 0.5, 0.75, 1];
 
 type Filters = {
@@ -209,7 +213,7 @@ export function App() {
     hierarchy: { filtered: 0, rootNodes: [], total: 0 },
     traces: { filtered: 0, items: [], total: 0 },
   });
-  const [navMode, setNavMode] = useState<NavMode>("traces");
+  const [navMode, setNavMode] = useState<NavMode>("sessions");
   const [theme, setTheme] = useState<ThemeMode>(() => resolvePreferredTheme());
   const [eventsConnected, setEventsConnected] = useState(false);
   const [expandedNodeOverrides, setExpandedNodeOverrides] = useState<
@@ -529,12 +533,17 @@ export function App() {
       return;
     }
 
+    const currentSelectedNode =
+      selectedNodeId && selectedSessionNode
+        ? findNodeById([selectedSessionNode], selectedNodeId)
+        : null;
+    const fallbackTraceId = getNewestTraceId(selectedSessionNode);
     const fallbackNodeId =
-      selectedNodeId &&
-      selectedSessionNode &&
-      findNodeById([selectedSessionNode], selectedNodeId)
-        ? selectedNodeId
-        : (selectedSessionNode?.id ?? null);
+      currentSelectedNode?.type === "trace"
+        ? currentSelectedNode.id
+        : fallbackTraceId
+          ? toTraceNodeId(fallbackTraceId)
+          : (selectedSessionNode?.id ?? null);
     if (fallbackNodeId !== selectedNodeId) {
       startTransition(() => setSelectedNodeId(fallbackNodeId));
     }
@@ -800,11 +809,17 @@ export function App() {
         : getNewestTraceId(node);
     const nextSessionId =
       nodePath[0]?.type === "session" ? nodePath[0].id : selectedSessionId;
+    const nextSelectedNodeId =
+      node.type === "trace"
+        ? node.id
+        : nextTraceId
+          ? toTraceNodeId(nextTraceId)
+          : node.id;
 
     startTransition(() => {
       setNavMode("sessions");
       setSelectedSessionId(nextSessionId ?? null);
-      setSelectedNodeId(node.id);
+      setSelectedNodeId(nextSelectedNodeId);
       setSelectedTraceId(nextTraceId);
       setDetailTab("conversation");
     });
@@ -828,6 +843,28 @@ export function App() {
   const activeTab = detailTabs.some((tab) => tab.id === detailTab)
     ? detailTab
     : (detailTabs[0]?.id ?? "conversation");
+  const sessionOptions = useMemo(
+    () =>
+      sessionNodes.map((node) => ({
+        label: getHierarchyNodeCopy(node, traceById).label,
+        value: node.id,
+      })),
+    [sessionNodes, traceById],
+  );
+
+  const handleSessionChange = (sessionId: string) => {
+    const sessionNode =
+      sessionNodes.find((node) => node.id === sessionId) ?? null;
+    const nextTraceId = getNewestTraceId(sessionNode);
+
+    startTransition(() => {
+      setNavMode("sessions");
+      setSelectedSessionId(sessionId);
+      setSelectedNodeId(nextTraceId ? toTraceNodeId(nextTraceId) : sessionId);
+      setSelectedTraceId(nextTraceId);
+      setDetailTab("conversation");
+    });
+  };
 
   return (
     <div className="app-shell">
@@ -933,146 +970,51 @@ export function App() {
           </Card>
 
           <div className="workspace-grid">
-            <Card className="sidebar-card navigator-card inspector-card">
-              <CardHeader>
-                <div className="navigator-header">
-                  <div>
-                    <CardTitle>Navigate</CardTitle>
-                    <CardDescription>
-                      {navMode === "sessions"
-                        ? formatCountLabel(sessionNodes.length, "session")
-                        : formatCountLabel(traceItems.length, "trace")}
-                    </CardDescription>
-                  </div>
-                  <div
-                    className="nav-switch"
-                    role="tablist"
-                    aria-label="Navigation mode"
-                  >
-                    <button
-                      type="button"
-                      className={cn(
-                        "nav-switch-button",
-                        navMode === "traces" && "is-active",
-                      )}
-                      onClick={showTracesMode}
+            <Card className="sidebar-card session-sidebar-card inspector-card">
+              <div className="session-sidebar-shell">
+                {sessionOptions.length > 1 ? (
+                  <div className="session-sidebar-toolbar">
+                    <div className="session-sidebar-toolbar-copy">
+                      <div className="session-sidebar-toolbar-title">
+                        Session
+                      </div>
+                      <div className="session-sidebar-toolbar-meta">
+                        {formatCountLabel(sessionNodes.length, "session")}
+                      </div>
+                    </div>
+                    <select
+                      className="ui-select session-sidebar-select"
+                      value={
+                        selectedSessionId ?? sessionOptions[0]?.value ?? ""
+                      }
+                      onChange={(event) =>
+                        handleSessionChange(event.target.value)
+                      }
                     >
-                      Traces
-                    </button>
-                    <button
-                      type="button"
-                      className={cn(
-                        "nav-switch-button",
-                        navMode === "sessions" && "is-active",
-                      )}
-                      onClick={showSessionsMode}
-                    >
-                      Sessions
-                    </button>
+                      {sessionOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
-                </div>
-              </CardHeader>
-              <CardContent className="navigator-content content-scroll">
-                {navMode === "sessions" ? (
-                  sessionNodes.length ? (
-                    <HierarchyTree
-                      defaultExpandedNodeIds={defaultExpandedNodeIds}
-                      expandedNodeOverrides={expandedNodeOverrides}
-                      maxDurationMs={navigatorMaxDurationMs}
-                      nodes={sessionNodes}
-                      onSelect={handleHierarchySelect}
-                      onToggle={toggleNodeExpansion}
-                      selectedNodeId={selectedNodeId}
-                      selectedTraceId={selectedTraceId}
-                      traceById={traceById}
-                    />
-                  ) : (
+                ) : null}
+
+                {selectedTimelineModel ? (
+                  <HierarchyTimelineOverview
+                    model={selectedTimelineModel}
+                    onSelectRow={handleTimelineSelect}
+                  />
+                ) : (
+                  <div className="session-sidebar-empty">
                     <EmptyState
                       icon={Network}
                       title="No sessions yet"
-                      description="Trigger any traced LLM call and session hierarchy will appear here."
+                      description="Trigger any traced LLM call and the session timeline will appear here."
                     />
-                  )
-                ) : traceItems.length ? (
-                  <div className="trace-group-list">
-                    {traceGroups.map((group) => {
-                      const isCollapsed =
-                        collapsedTraceGroups[group.id] ?? false;
-                      const hasActiveTrace = group.items.some(
-                        (trace) => trace.id === selectedTraceId,
-                      );
-                      const groupCostLabel = formatUsdCost(group.costUsd);
-
-                      return (
-                        <div
-                          key={group.id}
-                          className={cn(
-                            "trace-group",
-                            hasActiveTrace && "has-active-trace",
-                          )}
-                        >
-                          <button
-                            type="button"
-                            className="trace-group-button"
-                            onClick={() => toggleTraceGroupCollapse(group.id)}
-                          >
-                            <div className="trace-group-copy">
-                              <div className="trace-group-title">
-                                {group.label}
-                              </div>
-                              <div className="trace-group-meta">
-                                {group.meta}
-                              </div>
-                            </div>
-                            <div className="trace-group-side">
-                              {group.isAggregateCost || groupCostLabel ? (
-                                <TraceMetricPill
-                                  tone={groupCostLabel ? "cost" : "default"}
-                                >
-                                  Total {groupCostLabel ?? "n/a"}
-                                </TraceMetricPill>
-                              ) : null}
-                              <Badge variant="secondary">
-                                {formatCountLabel(group.items.length, "trace")}
-                              </Badge>
-                              <ChevronRight
-                                className={cn(
-                                  "trace-group-chevron",
-                                  !isCollapsed && "is-open",
-                                )}
-                              />
-                            </div>
-                          </button>
-
-                          {!isCollapsed ? (
-                            <div className="nav-list trace-group-body">
-                              {group.items.map((trace) => {
-                                return (
-                                  <TraceNavigatorItem
-                                    key={trace.id}
-                                    maxDurationMs={navigatorMaxDurationMs}
-                                    onClick={() =>
-                                      selectTraceFromList(trace.id)
-                                    }
-                                    selected={selectedTraceId === trace.id}
-                                    trace={trace}
-                                  />
-                                );
-                              })}
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })}
                   </div>
-                ) : (
-                  <EmptyState
-                    icon={Clock3}
-                    title="No traces yet"
-                    description="Trigger any traced LLM call and traces will appear here."
-                  />
                 )}
-              </CardContent>
+              </div>
             </Card>
 
             <Card className="timeline-card content-card inspector-card">
@@ -1097,22 +1039,14 @@ export function App() {
                       }));
                     })
                   }
-                  timelineModel={selectedTimelineModel}
+                  timelineModel={null}
                 />
-              ) : navMode === "traces" ? (
-                <CardContent className="content-scroll">
-                  <EmptyState
-                    icon={ArrowUpRight}
-                    title="Select a trace"
-                    description="Choose a trace on the left to inspect the full request, response, context, and stream details."
-                  />
-                </CardContent>
               ) : (
                 <CardContent className="content-scroll">
                   <EmptyState
                     icon={ArrowUpRight}
-                    title="Select a trace from the session tree"
-                    description="Choose any trace or hierarchy node on the left to inspect the newest matching call."
+                    title="Select a trace from the session timeline"
+                    description="Choose any call on the left to inspect the full request, response, context, and stream details."
                   />
                 </CardContent>
               )}
@@ -1515,16 +1449,14 @@ function HierarchyTimelineOverview({
   model: HierarchyTimelineModel;
   onSelectRow: (nodeId: string) => void;
 }) {
-  const [collapsed, setCollapsed] = useState(false);
   const totalCostLabel = formatCostSummaryLabel(
     model.costUsd,
     model.rows.length > 1,
   );
+  const hasTraceRows = model.rows.some((row) => row.type === "trace");
 
   return (
-    <div
-      className={cn("hierarchy-timeline-panel", collapsed && "is-collapsed")}
-    >
+    <div className="hierarchy-timeline-panel">
       <div className="hierarchy-timeline-header">
         <div>
           <div className="hierarchy-timeline-title">Session timeline</div>
@@ -1540,108 +1472,142 @@ function HierarchyTimelineOverview({
           <TraceMetricPill tone="latency">
             {formatElapsedLabel(model.durationMs)}
           </TraceMetricPill>
-          <button
-            type="button"
-            className="ui-button ui-button-outline timeline-toggle-button"
-            onClick={() => setCollapsed((current) => !current)}
-          >
-            {collapsed ? "Show timeline" : "Hide timeline"}
-          </button>
         </div>
       </div>
 
-      {!collapsed ? (
-        <>
-          <div className="hierarchy-timeline-axis" aria-hidden="true">
-            <div />
-            <div />
-            <div className="hierarchy-timeline-axis-track">
-              {TIMELINE_AXIS_STOPS.map((stop) => (
-                <span
-                  key={stop}
-                  className="hierarchy-timeline-axis-tick"
-                  style={
-                    { "--timeline-axis-offset": String(stop) } as CSSProperties
-                  }
-                >
-                  <span className="hierarchy-timeline-axis-label">
-                    {formatElapsedLabel(model.durationMs * stop)}
-                  </span>
-                </span>
-              ))}
-            </div>
-          </div>
+      {hasTraceRows ? (
+        <div className="hierarchy-timeline-hint">
+          Click a call row to inspect it on the right.
+        </div>
+      ) : null}
 
-          <div
-            className="hierarchy-timeline-list"
-            role="list"
-            aria-label="Nested session timeline"
-          >
-            {model.rows.map((row) => (
-              <button
+      <div className="hierarchy-timeline-axis" aria-hidden="true">
+        <div />
+        <div />
+        <div className="hierarchy-timeline-axis-track">
+          {TIMELINE_AXIS_STOPS.map((stop) => (
+            <span
+              key={stop}
+              className="hierarchy-timeline-axis-tick"
+              style={
+                { "--timeline-axis-offset": String(stop) } as CSSProperties
+              }
+            >
+              <span className="hierarchy-timeline-axis-label">
+                {formatElapsedLabel(model.durationMs * stop)}
+              </span>
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div
+        className="hierarchy-timeline-list"
+        role="list"
+        aria-label="Nested session timeline"
+      >
+        {model.rows.map((row) => {
+          const isTraceRow = row.type === "trace";
+          const rowClassName = cn(
+            "hierarchy-timeline-row",
+            isTraceRow ? "is-clickable" : "is-structure",
+            row.depth === 0 && "is-root",
+            row.isActive && "is-active",
+            row.isDetailTrace && "is-detail-trace",
+            row.isInPath && "is-in-path",
+            `is-${row.type.replace(/[^a-z0-9-]/gi, "-")}`,
+          );
+          const rowStyle = {
+            "--timeline-depth": String(row.depth),
+            "--timeline-offset": String(
+              model.durationMs > 0 ? row.offsetMs / model.durationMs : 0,
+            ),
+            "--timeline-span": String(
+              model.durationMs > 0 ? row.durationMs / model.durationMs : 1,
+            ),
+          } as CSSProperties;
+          const rowContent = (
+            <Fragment>
+              <div className="hierarchy-timeline-row-time">
+                {formatTimelineTimestamp(row.startedAt)}
+              </div>
+              <div className="hierarchy-timeline-row-labels">
+                <div className="hierarchy-timeline-row-title">
+                  <span className="hierarchy-timeline-row-title-text">
+                    {row.label}
+                  </span>
+                  <Badge
+                    variant="secondary"
+                    className="hierarchy-timeline-pill"
+                    semantic={row.badge}
+                  >
+                    {row.badge}
+                  </Badge>
+                </div>
+                <div className="hierarchy-timeline-row-meta">{row.meta}</div>
+              </div>
+              <div className="hierarchy-timeline-row-bars">
+                <div
+                  className="hierarchy-timeline-row-track"
+                  aria-hidden="true"
+                >
+                  <span className="hierarchy-timeline-row-bar" />
+                </div>
+                <div className="hierarchy-timeline-row-duration">
+                  {formatElapsedLabel(row.durationMs)}
+                </div>
+                {isTraceRow ? (
+                  <div className="hierarchy-timeline-row-action">
+                    <span
+                      className="hierarchy-timeline-row-inspect"
+                      aria-hidden="true"
+                    >
+                      Inspect
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+            </Fragment>
+          );
+
+          if (isTraceRow) {
+            return (
+              <div
                 key={row.id}
-                type="button"
                 role="listitem"
-                className={cn(
-                  "hierarchy-timeline-row",
-                  row.depth === 0 && "is-root",
-                  row.isActive && "is-active",
-                  row.isDetailTrace && "is-detail-trace",
-                  row.isInPath && "is-in-path",
-                  `is-${row.type.replace(/[^a-z0-9-]/gi, "-")}`,
-                )}
-                style={
-                  {
-                    "--timeline-depth": String(row.depth),
-                    "--timeline-offset": String(
-                      model.durationMs > 0
-                        ? row.offsetMs / model.durationMs
-                        : 0,
-                    ),
-                    "--timeline-span": String(
-                      model.durationMs > 0
-                        ? row.durationMs / model.durationMs
-                        : 1,
-                    ),
-                  } as CSSProperties
-                }
                 title={buildHierarchyTimelineRowTooltip(row)}
                 aria-current={
                   row.isActive || row.isDetailTrace ? "true" : undefined
                 }
-                onClick={() => onSelectRow(row.id)}
               >
-                <div className="hierarchy-timeline-row-time">
-                  {formatTimelineTimestamp(row.startedAt)}
-                </div>
-                <div className="hierarchy-timeline-row-labels">
-                  <div className="hierarchy-timeline-row-title">
-                    <span className="hierarchy-timeline-row-title-text">
-                      {row.label}
-                    </span>
-                    <Badge
-                      variant="secondary"
-                      className="hierarchy-timeline-pill"
-                      semantic={row.badge}
-                    >
-                      {row.badge}
-                    </Badge>
-                  </div>
-                  <div className="hierarchy-timeline-row-meta">{row.meta}</div>
-                </div>
-                <div className="hierarchy-timeline-row-bars" aria-hidden="true">
-                  <div className="hierarchy-timeline-row-track">
-                    <span className="hierarchy-timeline-row-bar" />
-                  </div>
-                  <div className="hierarchy-timeline-row-duration">
-                    {formatElapsedLabel(row.durationMs)}
-                  </div>
-                </div>
-              </button>
-            ))}
-          </div>
-        </>
-      ) : null}
+                <button
+                  type="button"
+                  className={rowClassName}
+                  style={rowStyle}
+                  onClick={() => onSelectRow(row.id)}
+                >
+                  {rowContent}
+                </button>
+              </div>
+            );
+          }
+
+          return (
+            <div
+              key={row.id}
+              role="listitem"
+              className={rowClassName}
+              style={rowStyle}
+              title={buildHierarchyTimelineRowTooltip(row)}
+              aria-current={
+                row.isActive || row.isDetailTrace ? "true" : undefined
+              }
+            >
+              {rowContent}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1693,15 +1659,10 @@ function TraceDetailPanel({
     ? getUsageCostUsd(detail.usage)
     : (fallbackTrace?.costUsd ?? null);
   const detailCostLabel = formatUsdCost(detailCostUsd);
+  const hasSecondaryInspector = Boolean(detail && timelineModel);
 
   return (
     <div className="trace-detail-panel" role="region" aria-label="Trace detail">
-      {timelineModel ? (
-        <HierarchyTimelineOverview
-          model={timelineModel}
-          onSelectRow={onSelectTimelineNode}
-        />
-      ) : null}
       <div className="trace-detail-header">
         <div className="trace-detail-heading">
           <div className="trace-detail-title-row">
@@ -1739,30 +1700,51 @@ function TraceDetailPanel({
 
       <div className="trace-detail-body">
         {detail ? (
-          <Fragment>
-            <div className="trace-detail-toolbar">
-              <Tabs value={activeTab} onChange={onTabChange}>
-                <TabsList className="detail-tabs">
-                  {detailTabs.map((tab) => (
-                    <TabsTrigger key={tab.id} value={tab.id}>
-                      {tab.label}
-                    </TabsTrigger>
-                  ))}
-                </TabsList>
-              </Tabs>
-              <Button
-                variant="outline"
-                onClick={() => onToggleJsonMode(activeTab)}
-              >
-                <Boxes data-icon="inline-start" />
-                {jsonMode === "formatted" ? "Raw JSON" : "Formatted"}
-              </Button>
+          <div
+            className={cn(
+              "trace-detail-main",
+              hasSecondaryInspector && "has-secondary-inspector",
+            )}
+          >
+            <div className="trace-detail-primary">
+              <div className="trace-detail-toolbar">
+                <Tabs value={activeTab} onChange={onTabChange}>
+                  <TabsList className="detail-tabs">
+                    {detailTabs.map((tab) => (
+                      <TabsTrigger key={tab.id} value={tab.id}>
+                        {tab.label}
+                      </TabsTrigger>
+                    ))}
+                  </TabsList>
+                </Tabs>
+                <Button
+                  variant="outline"
+                  onClick={() => onToggleJsonMode(activeTab)}
+                >
+                  <Boxes data-icon="inline-start" />
+                  {jsonMode === "formatted" ? "Raw JSON" : "Formatted"}
+                </Button>
+              </div>
+              <Separator />
+              <div className="trace-detail-scroll">
+                {renderTabContent(
+                  activeTab,
+                  detail,
+                  jsonMode,
+                  onApplyTagFilter,
+                )}
+              </div>
             </div>
-            <Separator />
-            <div className="trace-detail-scroll">
-              {renderTabContent(activeTab, detail, jsonMode, onApplyTagFilter)}
-            </div>
-          </Fragment>
+
+            {timelineModel ? (
+              <aside className="trace-detail-secondary">
+                <HierarchyTimelineOverview
+                  model={timelineModel}
+                  onSelectRow={onSelectTimelineNode}
+                />
+              </aside>
+            ) : null}
+          </div>
         ) : (
           <div className="trace-detail-empty">
             <EmptyState
@@ -2059,7 +2041,7 @@ function ConversationBubble({ content, role }: { content: any; role: string }) {
     <div className={clsx("conversation-row", tone)}>
       <div className="conversation-role">{role}</div>
       <div className="conversation-bubble">
-        <RichMessageContent content={content} />
+        <RichMessageContent content={content} role={role} />
       </div>
     </div>
   );
@@ -2083,7 +2065,7 @@ function ToolResultBubble({
           {toolCallId ? <Badge variant="secondary">{toolCallId}</Badge> : null}
         </div>
         <div className="tool-result-content">
-          <RichMessageContent content={content} />
+          <RichMessageContent content={content} role="tool" />
         </div>
       </div>
     </div>
@@ -2112,15 +2094,26 @@ function ToolCallBubble({ index, toolCall }: { index: number; toolCall: any }) {
   );
 }
 
-function RichMessageContent({ content }: { content: any }) {
+function RichMessageContent({
+  content,
+  role,
+}: {
+  content: any;
+  role?: string;
+}) {
   const jsonValue = detectJsonValue(content);
   const markdown = jsonValue === null ? toMarkdownText(content) : null;
   const collapseText = getMessageCollapseText(content, jsonValue, markdown);
-  const canCollapse = shouldCollapseMessage(collapseText);
+  const canCollapse = shouldCollapseMessage(collapseText, role);
   const isStructured = jsonValue !== null || markdown === null;
-  const collapsedHeight = isStructured
-    ? MESSAGE_COLLAPSE_HEIGHT_STRUCTURED
-    : MESSAGE_COLLAPSE_HEIGHT_PROSE;
+  const collapsedHeight =
+    role === "system"
+      ? isStructured
+        ? MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM
+        : MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM
+      : isStructured
+        ? MESSAGE_COLLAPSE_HEIGHT_STRUCTURED
+        : MESSAGE_COLLAPSE_HEIGHT_PROSE;
   const summaryLabel = formatCollapsedSummary(collapseText);
   const [expanded, setExpanded] = useState(false);
 
@@ -2676,7 +2669,7 @@ function StructuredMessageCard({
       </div>
       <div className="message-card-body">
         {hasContent ? (
-          <RichMessageContent content={message.content} />
+          <RichMessageContent content={message.content} role={message.role} />
         ) : isToolCallTurn ? (
           <div className="message-card-hint">Tool call emitted.</div>
         ) : (
@@ -3107,9 +3100,7 @@ function getTraceDisplayCopy(
   };
 }
 
-function groupTracesForNav(
-  items: TraceSummary[],
-): Array<{
+function groupTracesForNav(items: TraceSummary[]): Array<{
   costUsd: number | null;
   id: string;
   isAggregateCost: boolean;
@@ -3944,6 +3935,10 @@ function toSessionNodeId(sessionId: string): string {
   return `session:${sessionId}`;
 }
 
+function toTraceNodeId(traceId: string): string {
+  return `trace:${traceId}`;
+}
+
 function shortId(value: string): string {
   if (!value) {
     return "unknown";
@@ -4333,9 +4328,17 @@ function getMessageCollapseText(
   return JSON.stringify(content, null, 2) || "";
 }
 
-function shouldCollapseMessage(text: string): boolean {
+function shouldCollapseMessage(text: string, role?: string): boolean {
   if (!text) {
     return false;
+  }
+
+  if (role === "system") {
+    if (text.length > MESSAGE_COLLAPSE_CHAR_LIMIT_SYSTEM) {
+      return true;
+    }
+
+    return countLines(text) > MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM;
   }
 
   if (text.length > MESSAGE_COLLAPSE_CHAR_LIMIT) {
@@ -4461,7 +4464,9 @@ function formatCompactCount(value: number): string {
   }).format(value);
 }
 
-function getSemanticBadgeValue(value: string | null | undefined): string | null {
+function getSemanticBadgeValue(
+  value: string | null | undefined,
+): string | null {
   if (!value) {
     return null;
   }

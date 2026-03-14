@@ -398,7 +398,7 @@ pre {
 .workspace-grid {
   display: grid;
   flex: 1;
-  grid-template-columns: minmax(32rem, 34rem) minmax(0, 1fr);
+  grid-template-columns: minmax(40rem, 46rem) minmax(0, 1fr);
   gap: 0.9rem;
   align-items: start;
   min-height: 0;
@@ -440,6 +440,73 @@ pre {
 
 .navigator-card {
   align-self: start;
+}
+
+.session-sidebar-card {
+  overflow: hidden;
+}
+
+.session-sidebar-shell {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.session-sidebar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.95rem 0.95rem 0;
+}
+
+.session-sidebar-toolbar-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+
+.session-sidebar-toolbar-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+}
+
+.session-sidebar-toolbar-meta {
+  color: var(--muted-foreground);
+  font-size: 0.84rem;
+}
+
+.session-sidebar-select {
+  width: auto;
+  min-width: min(14rem, 100%);
+  max-width: 16rem;
+}
+
+.session-sidebar-shell .hierarchy-timeline-panel {
+  margin: 0;
+  flex: 1;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.session-sidebar-shell .hierarchy-timeline-list {
+  max-height: none;
+  flex: 1;
+}
+
+.session-sidebar-empty {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  padding: 0.95rem;
 }
 
 .content-card {
@@ -1047,12 +1114,6 @@ pre {
   flex-wrap: wrap;
 }
 
-.timeline-toggle-button {
-  min-height: 2.2rem;
-  padding: 0.52rem 0.9rem;
-  border-radius: 12px;
-}
-
 .hierarchy-timeline-title {
   font-size: 0.86rem;
   font-weight: 700;
@@ -1068,6 +1129,12 @@ pre {
   margin-top: 0.22rem;
   color: var(--muted-foreground);
   font-size: 0.82rem;
+}
+
+.hierarchy-timeline-hint {
+  color: var(--muted-foreground);
+  font-size: 0.76rem;
+  line-height: 1.4;
 }
 
 .hierarchy-timeline-axis {
@@ -1161,7 +1228,7 @@ pre {
   border: 1px solid transparent;
   background: rgba(255, 255, 255, 0.42);
   color: inherit;
-  cursor: pointer;
+  cursor: default;
   font: inherit;
   text-align: left;
   appearance: none;
@@ -1169,9 +1236,25 @@ pre {
   contain-intrinsic-size: 3rem;
 }
 
-.hierarchy-timeline-row:hover {
-  border-color: rgba(40, 93, 168, 0.12);
-  background: rgba(244, 249, 255, 0.72);
+.hierarchy-timeline-row.is-clickable {
+  cursor: pointer;
+  border-color: rgba(40, 93, 168, 0.08);
+  background: rgba(255, 255, 255, 0.7);
+  box-shadow:
+    0 6px 18px rgba(32, 50, 76, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.hierarchy-timeline-row.is-clickable:hover {
+  border-color: rgba(40, 93, 168, 0.14);
+  background: rgba(242, 248, 255, 0.86);
+}
+
+.hierarchy-timeline-row.is-structure {
+  border-style: dashed;
+  border-color: rgba(84, 100, 125, 0.08);
+  background: rgba(255, 255, 255, 0.24);
+  box-shadow: none;
 }
 
 .hierarchy-timeline-row:focus-visible {
@@ -1181,6 +1264,10 @@ pre {
 
 .hierarchy-timeline-row.is-in-path {
   background: rgba(240, 246, 255, 0.54);
+}
+
+.hierarchy-timeline-row.is-structure.is-in-path {
+  background: rgba(240, 246, 255, 0.38);
 }
 
 .hierarchy-timeline-row.is-detail-trace:not(.is-active) {
@@ -1257,6 +1344,7 @@ pre {
   align-items: center;
   gap: 0.45rem;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .hierarchy-timeline-row-title-text {
@@ -1275,14 +1363,28 @@ pre {
   line-height: 1.4;
 }
 
+.hierarchy-timeline-row.is-structure .hierarchy-timeline-row-title-text {
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+
+.hierarchy-timeline-row.is-structure .hierarchy-timeline-row-meta {
+  font-size: 0.74rem;
+}
+
 .hierarchy-timeline-row-bars {
   display: grid;
   grid-template-columns: minmax(10rem, 1fr) auto;
-  gap: 0.65rem;
+  grid-template-areas:
+    "track duration"
+    "action action";
+  column-gap: 0.65rem;
+  row-gap: 0.45rem;
   align-items: center;
 }
 
 .hierarchy-timeline-row-track {
+  grid-area: track;
   position: relative;
   height: 1rem;
 }
@@ -1334,12 +1436,46 @@ pre {
 }
 
 .hierarchy-timeline-row-duration {
+  grid-area: duration;
   color: var(--muted-foreground);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.72rem;
   font-weight: 600;
   text-align: right;
   white-space: nowrap;
+}
+
+.hierarchy-timeline-row-action {
+  grid-area: action;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.hierarchy-timeline-row-inspect {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: flex-end;
+  min-height: 2rem;
+  padding: 0.42rem 0.72rem;
+  border: 1px solid rgba(40, 93, 168, 0.18);
+  border-radius: 999px;
+  border-color: rgba(40, 93, 168, 0.18);
+  background: rgba(40, 93, 168, 0.08);
+  color: var(--primary-strong);
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.hierarchy-timeline-row.is-clickable:hover .hierarchy-timeline-row-inspect {
+  border-color: rgba(40, 93, 168, 0.26);
+  background: rgba(40, 93, 168, 0.12);
 }
 
 .trace-detail-header {
@@ -1428,16 +1564,78 @@ pre {
   display: flex;
   min-height: 0;
   flex: 1;
+  padding: 1rem;
+}
+
+.trace-detail-main {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.trace-detail-main.has-secondary-inspector {
+  grid-template-columns: minmax(0, 2.05fr) minmax(14.5rem, 0.72fr);
+}
+
+.trace-detail-primary,
+.trace-detail-secondary {
+  min-width: 0;
+  min-height: 0;
+}
+
+.trace-detail-primary {
+  display: flex;
+  min-height: 0;
   flex-direction: column;
   gap: 1rem;
-  padding: 1rem;
+}
+
+.trace-detail-secondary {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  overflow: auto;
+  padding-right: 0.15rem;
+}
+
+.trace-detail-secondary .hierarchy-timeline-panel {
+  margin: 0;
+  padding: 0.82rem 0.84rem 0.9rem;
+  border-radius: 14px;
+  background: rgba(250, 252, 255, 0.9);
+}
+
+.trace-detail-secondary .hierarchy-timeline-axis,
+.trace-detail-secondary .hierarchy-timeline-row {
+  grid-template-columns: 4.5rem minmax(0, 1fr) minmax(9rem, 12.5rem);
+  gap: 0.6rem;
+}
+
+.trace-detail-secondary .hierarchy-timeline-list {
+  max-height: min(34rem, calc(100dvh - 22rem));
+}
+
+.trace-detail-secondary .hierarchy-timeline-row-bars {
+  grid-template-columns: minmax(8rem, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.trace-detail-secondary .hierarchy-timeline-row-title-text {
+  font-size: 0.88rem;
+}
+
+.trace-detail-secondary .hierarchy-timeline-row-meta {
+  font-size: 0.76rem;
 }
 
 .trace-detail-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.85rem;
+  gap: 0.65rem;
 }
 
 .trace-detail-scroll {
@@ -1669,7 +1867,7 @@ pre {
   display: flex;
   flex-wrap: wrap;
   gap: 0.3rem;
-  padding: 0.24rem;
+  padding: 0.2rem;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: rgba(243, 247, 251, 0.92);
@@ -1680,7 +1878,7 @@ pre {
   background: transparent;
   color: var(--muted-foreground);
   border-radius: 10px;
-  padding: 0.6rem 0.9rem;
+  padding: 0.52rem 0.82rem;
   font-weight: 650;
   opacity: 0.88;
   transition:
@@ -2794,13 +2992,29 @@ pre {
   background: rgba(22, 32, 47, 0.52);
 }
 
-:root[data-theme="dark"] .hierarchy-timeline-row:hover {
-  border-color: rgba(134, 184, 255, 0.14);
-  background: rgba(28, 40, 58, 0.76);
+:root[data-theme="dark"] .hierarchy-timeline-hint {
+  color: rgba(182, 197, 219, 0.72);
+}
+
+:root[data-theme="dark"] .hierarchy-timeline-row.is-clickable {
+  border-color: rgba(134, 184, 255, 0.12);
+  background: rgba(24, 35, 52, 0.74);
+  box-shadow:
+    0 8px 20px rgba(2, 10, 24, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+:root[data-theme="dark"] .hierarchy-timeline-row.is-structure {
+  border-color: rgba(128, 153, 189, 0.08);
+  background: rgba(18, 27, 40, 0.26);
 }
 
 :root[data-theme="dark"] .hierarchy-timeline-row.is-in-path {
   background: rgba(27, 40, 60, 0.7);
+}
+
+:root[data-theme="dark"] .hierarchy-timeline-row.is-structure.is-in-path {
+  background: rgba(24, 35, 52, 0.38);
 }
 
 :root[data-theme="dark"] .hierarchy-timeline-row.is-detail-trace:not(.is-active) {
@@ -2827,6 +3041,17 @@ pre {
   color: rgba(182, 197, 219, 0.78);
 }
 
+:root[data-theme="dark"] .hierarchy-timeline-row-inspect {
+  border-color: rgba(134, 184, 255, 0.18);
+  background: rgba(134, 184, 255, 0.12);
+  color: rgba(186, 214, 255, 0.96);
+}
+
+:root[data-theme="dark"] .hierarchy-timeline-row-inspect:hover {
+  border-color: rgba(134, 184, 255, 0.24);
+  background: rgba(134, 184, 255, 0.18);
+}
+
 :root[data-theme="dark"] .hierarchy-timeline-row-title-text {
   color: var(--foreground);
 }
@@ -2842,6 +3067,10 @@ pre {
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.06),
     0 1px 3px rgba(2, 10, 24, 0.24);
+}
+
+:root[data-theme="dark"] .trace-detail-secondary .hierarchy-timeline-panel {
+  background: rgba(18, 27, 40, 0.9);
 }
 
 :root[data-theme="dark"] .tree-node-toggle {
@@ -3082,20 +3311,21 @@ pre {
     align-items: stretch;
   }
 
-  .hierarchy-timeline-axis {
-    grid-template-columns: 4.5rem minmax(0, 1fr);
+  .trace-detail-main.has-secondary-inspector {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .hierarchy-timeline-axis-track {
-    grid-column: 2;
+  .trace-detail-secondary {
+    overflow: visible;
+    padding-right: 0;
+  }
+
+  .hierarchy-timeline-axis {
+    grid-template-columns: 4.5rem minmax(0, 1fr) minmax(11rem, 1fr);
   }
 
   .hierarchy-timeline-row {
-    grid-template-columns: 4.5rem minmax(0, 1fr);
-  }
-
-  .hierarchy-timeline-row-bars {
-    grid-column: 2;
+    grid-template-columns: 4.5rem minmax(0, 1fr) minmax(11rem, 1fr);
   }
 
   .sheet-panel {
@@ -3194,6 +3424,28 @@ pre {
     justify-content: flex-start;
   }
 
+  .trace-detail-secondary .hierarchy-timeline-axis,
+  .trace-detail-secondary .hierarchy-timeline-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trace-detail-secondary .hierarchy-timeline-axis-track {
+    grid-column: auto;
+  }
+
+  .trace-detail-secondary .hierarchy-timeline-row-time {
+    text-align: left;
+  }
+
+  .trace-detail-secondary .hierarchy-timeline-row-bars {
+    grid-column: auto;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .trace-detail-secondary .hierarchy-timeline-row-action {
+    justify-content: flex-start;
+  }
+
   .hierarchy-timeline-header,
   .hierarchy-timeline-header-side {
     flex-direction: column;
@@ -3219,5 +3471,9 @@ pre {
   .hierarchy-timeline-row-bars {
     grid-column: auto;
     grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .hierarchy-timeline-row-action {
+    justify-content: flex-start;
   }
 }
