@@ -3047,7 +3047,7 @@ pre {
   color: rgba(186, 214, 255, 0.96);
 }
 
-:root[data-theme="dark"] .hierarchy-timeline-row-inspect:hover {
+:root[data-theme="dark"] .hierarchy-timeline-row.is-clickable:hover .hierarchy-timeline-row-inspect {
   border-color: rgba(134, 184, 255, 0.24);
   background: rgba(134, 184, 255, 0.18);
 }
