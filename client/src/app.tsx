@@ -117,14 +117,18 @@ type TraceInsights = {
 };
 
 type TraceRecord = {
+  attributes: Record<string, any>;
   context: Record<string, any>;
   endedAt: string | null;
   error: Record<string, any> | null;
+  events: Array<{ attributes: Record<string, any>; name: string; timestamp: string }>;
   hierarchy: TraceSummary["hierarchy"];
   id: string;
   kind: string;
   mode: "invoke" | "stream";
   model: string | null;
+  name: string;
+  parentSpanId: string | null;
   provider: string | null;
   request: {
     input?: {
@@ -134,6 +138,9 @@ type TraceRecord = {
     options?: Record<string, any>;
   };
   response: Record<string, any> | null;
+  spanContext: { spanId: string; traceId: string };
+  spanKind: string;
+  spanStatus: { code: string; message?: string };
   startedAt: string;
   status: "pending" | "ok" | "error";
   stream: null | {
@@ -185,7 +192,7 @@ type Filters = {
   tags: string;
 };
 
-type TabId = "context" | "conversation" | "request" | "response" | "stream";
+type TabId = "context" | "conversation" | "otel" | "request" | "response" | "stream";
 type JsonMode = "formatted" | "raw";
 
 type TraceTabModes = Partial<Record<TabId, JsonMode>>;
@@ -2395,6 +2402,23 @@ function renderTabContent(
           ) : null}
         </div>
       );
+    case "otel":
+      return (
+        <JsonCard
+          title="OTel span"
+          value={{
+            name: detail.name,
+            spanContext: detail.spanContext,
+            parentSpanId: detail.parentSpanId,
+            spanKind: detail.spanKind,
+            spanStatus: detail.spanStatus,
+            startTime: detail.startedAt,
+            endTime: detail.endedAt,
+            attributes: detail.attributes,
+            events: detail.events,
+          }}
+        />
+      );
     default:
       return null;
   }
@@ -3717,6 +3741,9 @@ function buildDetailTabs(
   if (detail.stream) {
     tabs.push({ id: "stream", label: "Stream" });
   }
+
+  tabs.push({ id: "otel", label: "OTel" });
+
   return tabs;
 }
 
