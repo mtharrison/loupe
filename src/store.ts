@@ -40,6 +40,9 @@ export class TraceStore extends EventEmitter {
   }
 
   addSpanEvent(spanId: string, event: SpanEventInput) {
+    // Loupe returns its own stable span handle from startSpan(). That handle is used to
+    // look up mutable in-memory records here, while trace.spanContext.spanId stores the
+    // OpenTelemetry span ID exposed on the resulting span data.
     const trace = this.traces.get(spanId);
     if (!trace) {
       return;
@@ -291,6 +294,9 @@ export class TraceStore extends EventEmitter {
       response: null,
       startedAt,
       spanContext: {
+        // The returned Loupe span handle (trace.id) is used for local mutation and SSE updates.
+        // spanContext contains the OpenTelemetry trace/span identifiers that are attached to
+        // the exported span payload and inherited by child spans.
         spanId: randomHexId(16),
         traceId: parentSpan?.spanContext.traceId || randomHexId(32),
       },
@@ -527,7 +533,11 @@ function randomId(): string {
 }
 
 function randomHexId(length: number): string {
-  return randomBytes(Math.floor(length / 2) + (length % 2)).toString('hex').slice(0, length);
+  if (length % 2 !== 0) {
+    throw new RangeError(`OpenTelemetry hex IDs must have an even length. Received: ${length}`);
+  }
+
+  return randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
 }
 
 function normalizeSpanEvent(event: SpanEventInput): SpanEvent {
@@ -561,9 +571,10 @@ function toStreamPayload(payload: unknown, spanEvent: SpanEvent): Record<string,
   const suffix = spanEvent.name.startsWith(STREAM_EVENT_NAME_PREFIX)
     ? spanEvent.name.slice(STREAM_EVENT_NAME_PREFIX.length)
     : spanEvent.name;
+  const eventType = suffix || 'event';
   return {
     ...safeClone(spanEvent.attributes || {}),
-    type: suffix || 'event',
+    type: eventType,
   };
 }
 

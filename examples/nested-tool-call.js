@@ -7,6 +7,7 @@ const process = require('node:process');
 
 const { getLocalLLMTracer, wrapChatModel } = require('../dist/index.js');
 
+const DEMO_TIMEOUT_MS = 15000;
 const PORT = Number(process.env.LLM_TRACE_PORT) || 4319;
 const SESSION_ID = `nested-tool-demo-${randomUUID().slice(0, 8)}`;
 
@@ -105,14 +106,44 @@ async function main() {
         };
       },
       async *stream(input) {
-        const response = await this.invoke(input);
+        const question = input?.messages?.[0]?.content || '';
         yield { type: 'begin', role: 'assistant' };
-        yield { type: 'chunk', content: response.message.content };
+        yield { type: 'chunk', content: 'Let me research that with the tool model.\n\n' };
+
+        let toolContent = '';
+        for await (const chunk of nestedResearchModel.stream(
+          {
+            messages: [
+              {
+                role: 'user',
+                content: `Research facts needed for: ${question}`,
+              },
+            ],
+          },
+          {},
+        )) {
+          if (chunk?.type === 'chunk' && typeof chunk.content === 'string') {
+            toolContent += chunk.content;
+          }
+        }
+
+        const finalContent = [
+          `Final answer for "${question}"`,
+          '',
+          toolContent,
+          '',
+          'Pack layers, waterproof gear, and comfortable shoes.',
+        ].join('\n');
+
+        yield { type: 'chunk', content: finalContent };
         yield {
           type: 'finish',
-          message: response.message,
+          message: { role: 'assistant', content: finalContent },
           tool_calls: [],
-          usage: response.usage,
+          usage: {
+            tokens: { prompt: 12, completion: 18 },
+            pricing: { prompt: 0.000001, completion: 0.000002 },
+          },
         };
       },
     },
@@ -176,8 +207,8 @@ function openBrowser(url) {
 
 async function waitForDashboardExit(url) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    log(`[demo] Non-interactive terminal detected. Leaving the dashboard up for 15 seconds: ${url}`);
-    await new Promise((resolve) => setTimeout(resolve, 15000));
+    log(`[demo] Non-interactive terminal detected. Leaving the dashboard up for ${Math.round(DEMO_TIMEOUT_MS / 1000)} seconds: ${url}`);
+    await new Promise((resolve) => setTimeout(resolve, DEMO_TIMEOUT_MS));
     return;
   }
 

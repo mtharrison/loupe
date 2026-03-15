@@ -137,34 +137,34 @@ test('OpenTelemetry-style span lifecycle exports record traces through the singl
 
   await startTraceServer({ port });
 
-   const invokeTraceId = startSpan(
+   const invokeSpanId = startSpan(
      { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
      { mode: 'invoke', name: 'openai.chat.completions', request: { input: { messages: [{ role: 'user', content: 'hello' }] }, options: {} } },
    );
-   endSpan(invokeTraceId, {
+   endSpan(invokeSpanId, {
      message: { role: 'assistant', content: 'world' },
      tool_calls: [],
      usage: { tokens: { prompt: 1, completion: 2 }, pricing: { prompt: 0.1, completion: 0.2 } },
    });
 
-   const streamTraceId = startSpan(
+   const streamSpanId = startSpan(
      { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
      { mode: 'stream', name: 'openai.chat.completions', request: { input: { messages: [{ role: 'user', content: 'stream' }] }, options: {} } },
    );
-   addSpanEvent(streamTraceId, { name: 'stream.begin', attributes: { role: 'assistant' } });
-   addSpanEvent(streamTraceId, { name: 'stream.chunk', attributes: { content: 'abc' } });
-   endSpan(streamTraceId, {
+   addSpanEvent(streamSpanId, { name: 'stream.begin', attributes: { role: 'assistant' } });
+   addSpanEvent(streamSpanId, { name: 'stream.chunk', attributes: { content: 'abc' } });
+   endSpan(streamSpanId, {
      type: 'finish',
      message: { role: 'assistant', content: 'abc' },
      tool_calls: [],
      usage: { tokens: { prompt: 2, completion: 3 }, pricing: { prompt: 0.01, completion: 0.02 } },
    });
 
-   const errorTraceId = startSpan(
+   const errorSpanId = startSpan(
      { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root' },
      { mode: 'invoke', name: 'llm.invoke', request: { input: { messages: [] }, options: {} } },
    );
-   recordException(errorTraceId, new Error('boom'));
+   recordException(errorSpanId, new Error('boom'));
 
    const traces = tracer.store.list().items;
    assert.equal(traces.length, 3);
@@ -187,6 +187,10 @@ test('OpenTelemetry-style span lifecycle exports record traces through the singl
    assert.equal(span.events[1].attributes.content, 'abc');
    assert.match(span.spanContext.traceId, /^[0-9a-f]{32}$/);
    assert.match(span.spanContext.spanId, /^[0-9a-f]{16}$/);
+   assert.equal(Buffer.from(span.spanContext.traceId, 'hex').length, 16);
+   assert.equal(Buffer.from(span.spanContext.spanId, 'hex').length, 8);
+   assert.equal(Buffer.from(span.spanContext.traceId, 'hex').toString('hex'), span.spanContext.traceId);
+   assert.equal(Buffer.from(span.spanContext.spanId, 'hex').toString('hex'), span.spanContext.spanId);
 });
 
 test('ring buffer evicts the oldest traces', async () => {

@@ -33,7 +33,7 @@ export function safeClone<T>(value: T): T {
 
 export function toSpanEventInputFromChunk(chunk: unknown): SpanEventInput {
   const payload = safeClone(chunk) as Record<string, any> | null;
-  const chunkType = typeof payload?.type === 'string' && payload.type ? payload.type : 'event';
+  const eventType = typeof payload?.type === 'string' && payload.type ? payload.type : 'event';
   const attributes = payload !== null && typeof payload === 'object' ? { ...payload } : {};
 
   if ('type' in attributes) {
@@ -42,7 +42,7 @@ export function toSpanEventInputFromChunk(chunk: unknown): SpanEventInput {
 
   return {
     attributes,
-    name: `stream.${chunkType}`,
+    name: `stream.${eventType}`,
     payload: payload ?? undefined,
   };
 }
