@@ -4,6 +4,8 @@
 
 # @mtharrison/loupe
 
+
+
 Loupe is a lightweight local tracing dashboard for LLM applications and agent systems. It captures full request and response payloads with tags and hierarchy context, then serves an inspector UI on `127.0.0.1` with no database, no containers, and no persistence.
 
 This package is for local development. Traces live in memory and are cleared on restart.
