@@ -211,14 +211,12 @@ export type TraceEvent = {
   span?: TraceRecord;
   spanId: string | null;
   timestamp: string;
-  trace?: TraceRecord;
-  traceId: string | null;
   type: string;
 };
 
 export type UIReloadEvent = {
   timestamp: string;
-  traceId: null;
+  spanId: null;
   type: 'ui:reload';
 };
 
@@ -313,12 +311,7 @@ export type LocalLLMTracer = {
   endSpan(spanId: string, response?: unknown): void;
   isEnabled(): boolean;
   recordException(spanId: string, error: unknown): void;
-  recordError(traceId: string, error: unknown): void;
-  recordInvokeFinish(traceId: string, response: unknown): void;
-  recordInvokeStart(context: TraceContext, request: TraceRequest): string;
-  recordStreamChunk(traceId: string, chunk: unknown): void;
-  recordStreamFinish(traceId: string, chunk: unknown): void;
-  recordStreamStart(context: TraceContext, request: TraceRequest): string;
+  runWithActiveSpan<T>(spanId: string, callback: () => T): T;
   startSpan(context: TraceContext, options?: SpanStartOptions): string;
   startServer(): Promise<{ host: string; port: number; url: string } | null>;
   store: any;

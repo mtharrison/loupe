@@ -125,9 +125,28 @@ Supported demo environment variables: `OPENAI_MODEL`, `LLM_TRACE_PORT`, `LOUPE_O
 
 The script tries to open the dashboard automatically and prints the local URL either way. Set `LOUPE_OPEN_BROWSER=0` if you want to suppress the browser launch.
 
+### Runnable Nested Tool-Call Demo
+
+`examples/nested-tool-call.js` is a credential-free demo that:
+
+- starts the Loupe dashboard eagerly
+- wraps a root assistant model and a nested tool model
+- invokes the nested tool model from inside the parent model call
+- shows parent/child spans linked on the same trace
+
+Run it with:
+
+```bash
+npm install
+export LLM_TRACE_ENABLED=1
+node examples/nested-tool-call.js
+```
+
 ## Low-Level Lifecycle API
 
-If you need full control over trace boundaries, Loupe also exposes a lower-level span lifecycle API modeled on OpenTelemetry concepts: start a span, add events, end it, and record exceptions.
+If you need full control over trace boundaries, Loupe exposes a lower-level span lifecycle API modeled on OpenTelemetry concepts: start a span, add events, end it, and record exceptions.
+
+Loupe stores GenAI span attributes using the OpenTelemetry semantic convention names where they apply, including `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.system`, `gen_ai.provider.name`, `gen_ai.operation.name`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and `gen_ai.conversation.id`.
 
 Start the dashboard during app startup, then instrument a model call:
 
@@ -220,11 +239,9 @@ try {
 }
 ```
 
-The older `recordInvokeStart()`, `recordInvokeFinish()`, `recordStreamStart()`, `recordStreamChunk()`, `recordStreamFinish()`, and `recordError()` helpers remain available as compatibility wrappers over the span lifecycle API.
-
 ## Trace Context
 
-Loupe gets its hierarchy and filters from the context you pass to `startSpan()` and the compatibility `record*` helpers.
+Loupe gets its hierarchy and filters from the context you pass to `startSpan()`.
 
 ### Generic context fields
 
@@ -356,7 +373,7 @@ Starts the local dashboard server eagerly instead of waiting for the first trace
 
 ### `startSpan(context, options?, config?)`
 
-Creates a span and returns its Loupe `spanId`. Pass `mode`, `name`, and `request` in `options` to describe the operation.
+Creates a span and returns its Loupe `spanId`. Pass `mode`, `name`, and `request` in `options` to describe the operation. Nested spans are linked automatically when wrapped calls invoke other wrapped calls in the same async flow.
 
 ### `addSpanEvent(spanId, event, config?)`
 
@@ -369,10 +386,6 @@ Marks a span as complete and stores the final response payload.
 ### `recordException(spanId, error, config?)`
 
 Marks a span as failed and stores a serialized exception payload.
-
-### Compatibility `record*` helpers
-
-Loupe still exports `recordInvokeStart()`, `recordInvokeFinish()`, `recordStreamStart()`, `recordStreamChunk()`, `recordStreamFinish()`, and `recordError()` for existing integrations. They forward to the span lifecycle API above.
 
 All of these functions forward to the singleton tracer returned by `getLocalLLMTracer()`.
 

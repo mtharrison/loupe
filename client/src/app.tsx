@@ -192,8 +192,6 @@ type TraceTabModes = Partial<Record<TabId, JsonMode>>;
 type TraceEventPayload = {
   span?: TraceRecord;
   spanId?: string | null;
-  trace?: TraceRecord;
-  traceId?: string | null;
   type?: string;
 };
 
@@ -490,8 +488,8 @@ export function App() {
 
   const handleSseMessage = useEffectEvent((data: string) => {
     const payload = parseEvent(data);
-    const nextTrace = payload?.span ?? payload?.trace;
-    const nextTraceId = payload?.spanId ?? payload?.traceId;
+    const nextTrace = payload?.span;
+    const nextTraceId = payload?.spanId;
     if (payload?.type === "ui:reload") {
       window.location.reload();
       return;
@@ -502,35 +500,30 @@ export function App() {
     }
 
     if (!queryString) {
-      if (
-        (payload?.type === "span:update" || payload?.type === "span:end" || payload?.type === "trace:update") &&
-        nextTrace
-      ) {
+      if ((payload?.type === "span:update" || payload?.type === "span:end") && nextTrace) {
         applyIncrementalTraceUpdate(nextTrace);
         return;
       }
 
-      if ((payload?.type === "span:start" || payload?.type === "trace:add") && nextTrace) {
+      if (payload?.type === "span:start" && nextTrace) {
         applyIncrementalTraceAdd(nextTrace);
         scheduleRefresh(180);
         return;
       }
 
-      if (payload?.type === "span:evict" || payload?.type === "trace:evict") {
+      if (payload?.type === "span:evict") {
         applyIncrementalTraceEvict(nextTraceId);
         scheduleRefresh(180);
         return;
       }
 
-      if (payload?.type === "span:clear" || payload?.type === "trace:clear") {
+      if (payload?.type === "span:clear") {
         clearIncrementalState();
         return;
       }
     }
 
-    scheduleRefresh(
-      payload?.type === "span:update" || payload?.type === "span:end" || payload?.type === "trace:update" ? 700 : 180,
-    );
+    scheduleRefresh(payload?.type === "span:update" || payload?.type === "span:end" ? 700 : 180);
   });
 
   useEffect(() => {

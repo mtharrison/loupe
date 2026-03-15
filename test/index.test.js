@@ -10,12 +10,6 @@ const {
   endSpan,
   getLocalLLMTracer,
   recordException,
-  recordError,
-  recordInvokeFinish,
-  recordInvokeStart,
-  recordStreamChunk,
-  recordStreamFinish,
-  recordStreamStart,
   startSpan,
   startTraceServer,
   wrapChatModel,
@@ -182,7 +176,14 @@ test('OpenTelemetry-style span lifecycle exports record traces through the singl
    assert.equal(span.name, 'openai.chat.completions');
    assert.equal(span.spanKind, 'CLIENT');
    assert.equal(span.spanStatus.code, 'OK');
+   assert.equal(span.attributes['gen_ai.request.model'], 'gpt-4.1');
+   assert.equal(span.attributes['gen_ai.system'], 'openai');
+   assert.equal(span.attributes['gen_ai.provider.name'], 'openai');
+   assert.equal(span.attributes['gen_ai.operation.name'], 'chat');
+   assert.equal(span.attributes['gen_ai.usage.input_tokens'], 2);
+   assert.equal(span.attributes['gen_ai.usage.output_tokens'], 3);
    assert.equal(span.events[0].name, 'stream.begin');
+   assert.equal(span.events[0].attributes['gen_ai.message.status'], 'in_progress');
    assert.equal(span.events[1].attributes.content, 'abc');
    assert.match(span.spanContext.traceId, /^[0-9a-f]{32}$/);
    assert.match(span.spanContext.spanId, /^[0-9a-f]{16}$/);
@@ -193,16 +194,63 @@ test('ring buffer evicts the oldest traces', async () => {
   tracer.store.clear();
   tracer.store.maxTraces = 2;
 
-  const one = tracer.recordInvokeStart({ sessionId: 'session-1', actorId: 'actor-a' }, { input: { messages: [] }, options: {} });
-  tracer.recordInvokeFinish(one, { message: { role: 'assistant', content: 'one' }, tool_calls: [], usage: {} });
-  const two = tracer.recordInvokeStart({ sessionId: 'session-1', actorId: 'actor-b' }, { input: { messages: [] }, options: {} });
-  tracer.recordInvokeFinish(two, { message: { role: 'assistant', content: 'two' }, tool_calls: [], usage: {} });
-  const three = tracer.recordInvokeStart({ sessionId: 'session-1', actorId: 'actor-c' }, { input: { messages: [] }, options: {} });
-  tracer.recordInvokeFinish(three, { message: { role: 'assistant', content: 'three' }, tool_calls: [], usage: {} });
+  const one = tracer.startSpan({ sessionId: 'session-1', actorId: 'actor-a' }, { mode: 'invoke', request: { input: { messages: [] }, options: {} } });
+  tracer.endSpan(one, { message: { role: 'assistant', content: 'one' }, tool_calls: [], usage: {} });
+  const two = tracer.startSpan({ sessionId: 'session-1', actorId: 'actor-b' }, { mode: 'invoke', request: { input: { messages: [] }, options: {} } });
+  tracer.endSpan(two, { message: { role: 'assistant', content: 'two' }, tool_calls: [], usage: {} });
+  const three = tracer.startSpan({ sessionId: 'session-1', actorId: 'actor-c' }, { mode: 'invoke', request: { input: { messages: [] }, options: {} } });
+  tracer.endSpan(three, { message: { role: 'assistant', content: 'three' }, tool_calls: [], usage: {} });
 
   assert.equal(tracer.store.get(one), null);
   assert.ok(tracer.store.get(two));
   assert.ok(tracer.store.get(three));
+});
+
+test('nested wrapped model calls create child spans on the same trace', async () => {
+  process.env.LLM_TRACE_ENABLED = '1';
+  const port = reservePort();
+  const tracer = getLocalLLMTracer({ maxTraces: 10, port });
+  tracer.store.clear();
+
+  const innerModel = wrapChatModel(
+    {
+      async invoke(input) {
+        return {
+          message: { role: 'assistant', content: `inner:${input.messages[0].content}` },
+          tool_calls: [],
+          usage: { tokens: { prompt: 1, completion: 1 }, pricing: { prompt: 0.1, completion: 0.2 } },
+        };
+      },
+      async *stream() {},
+    },
+    () => ({ sessionId: 'nested-session', rootActorId: 'assistant', actorId: 'tool-worker', provider: 'openai', model: 'gpt-4.1-mini' }),
+    { port },
+  );
+
+  const outerModel = wrapChatModel(
+    {
+      async invoke(input) {
+        await innerModel.invoke({ messages: [{ role: 'user', content: 'tool step' }] }, {});
+        return {
+          message: { role: 'assistant', content: `outer:${input.messages[0].content}` },
+          tool_calls: [],
+          usage: { tokens: { prompt: 2, completion: 2 }, pricing: { prompt: 0.1, completion: 0.2 } },
+        };
+      },
+      async *stream() {},
+    },
+    () => ({ sessionId: 'nested-session', rootActorId: 'assistant', actorId: 'assistant', provider: 'openai', model: 'gpt-4.1' }),
+    { port },
+  );
+
+  await outerModel.invoke({ messages: [{ role: 'user', content: 'outer step' }] }, {});
+
+  const traces = tracer.store.list().items;
+  assert.equal(traces.length, 2);
+  const outer = tracer.store.get(traces.find((item) => item.model === 'gpt-4.1').id);
+  const inner = tracer.store.get(traces.find((item) => item.model === 'gpt-4.1-mini').id);
+  assert.equal(inner.parentSpanId, outer.spanContext.spanId);
+  assert.equal(inner.spanContext.traceId, outer.spanContext.traceId);
 });
 
 test('hierarchy nests sessions, actors, child actors, stages, and guardrails', async () => {
@@ -211,19 +259,19 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
   const usage = { tokens: { prompt: 100, completion: 50 }, pricing: { prompt: 0.000001, completion: 0.000002 } };
   const expectedCost = 0.0002;
 
-  const root = tracer.recordInvokeStart(
+  const root = tracer.startSpan(
     { sessionId: 'session-1', rootSessionId: 'session-1', rootActorId: 'root-actor', actorId: 'root-actor', model: 'gpt-4.1' },
-    { input: { messages: [] }, options: {} },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
   );
-  tracer.recordInvokeFinish(root, { message: { role: 'assistant', content: 'root' }, tool_calls: [], usage });
+  tracer.endSpan(root, { message: { role: 'assistant', content: 'root' }, tool_calls: [], usage });
 
-  const delegated = tracer.recordInvokeStart(
+  const delegated = tracer.startSpan(
     { sessionId: 'session-1', rootSessionId: 'session-1', rootActorId: 'root-actor', actorId: 'child-actor', model: 'gpt-4.1' },
-    { input: { messages: [] }, options: {} },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
   );
-  tracer.recordInvokeFinish(delegated, { message: { role: 'assistant', content: 'delegated' }, tool_calls: [], usage });
+  tracer.endSpan(delegated, { message: { role: 'assistant', content: 'delegated' }, tool_calls: [], usage });
 
-  const workflow = tracer.recordInvokeStart(
+  const workflow = tracer.startSpan(
     {
       sessionId: 'session-1',
       rootSessionId: 'session-1',
@@ -232,11 +280,11 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
       stage: 'triage',
       model: 'gpt-4.1',
     },
-    { input: { messages: [] }, options: {} },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
   );
-  tracer.recordInvokeFinish(workflow, { message: { role: 'assistant', content: 'workflow' }, tool_calls: [], usage });
+  tracer.endSpan(workflow, { message: { role: 'assistant', content: 'workflow' }, tool_calls: [], usage });
 
-  const guardrail = tracer.recordInvokeStart(
+  const guardrail = tracer.startSpan(
     {
       sessionId: 'session-1',
       rootSessionId: 'session-1',
@@ -245,9 +293,9 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
       guardrailType: 'outputPolicyCheck',
       model: 'gpt-4.1',
     },
-    { input: { messages: [] }, options: {} },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
   );
-  tracer.recordInvokeFinish(guardrail, { message: { role: 'assistant', content: 'guardrail' }, tool_calls: [], usage });
+  tracer.endSpan(guardrail, { message: { role: 'assistant', content: 'guardrail' }, tool_calls: [], usage });
 
   const tree = tracer.store.hierarchy();
   assert.equal(tree.rootNodes.length, 1);
@@ -272,7 +320,7 @@ test('legacy context aliases still normalize into the generic hierarchy model', 
   const tracer = getLocalLLMTracer({ maxTraces: 10 });
   tracer.store.clear();
 
-  const traceId = tracer.recordInvokeStart(
+  const traceId = tracer.startSpan(
     {
       chatId: 'chat-legacy',
       rootChatId: 'chat-legacy',
@@ -281,9 +329,9 @@ test('legacy context aliases still normalize into the generic hierarchy model', 
       workflowState: 'triage',
       systemType: 'outputFilterStopBot',
     },
-    { input: { messages: [] }, options: {} },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
   );
-  tracer.recordInvokeFinish(traceId, { message: { role: 'assistant', content: 'done' }, tool_calls: [], usage: {} });
+  tracer.endSpan(traceId, { message: { role: 'assistant', content: 'done' }, tool_calls: [], usage: {} });
 
   const trace = tracer.store.get(traceId);
   assert.ok(trace);
@@ -301,7 +349,7 @@ test('derived insights surface structured input and guardrail context', async ()
   const tracer = getLocalLLMTracer({ maxTraces: 10 });
   tracer.store.clear();
 
-  const traceId = tracer.recordInvokeStart(
+  const traceId = tracer.startSpan(
     {
       sessionId: 'session-insights',
       rootSessionId: 'session-insights',
@@ -314,23 +362,26 @@ test('derived insights surface structured input and guardrail context', async ()
       provider: 'openai',
     },
     {
-      input: {
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a translation assistant. '.repeat(80),
-          },
-          {
-            role: 'user',
-            content:
-              '<user><instruction priority="high">Translate carefully.</instruction><option tone="formal">Formal</option></user>',
-          },
-        ],
+      mode: 'invoke',
+      request: {
+        input: {
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a translation assistant. '.repeat(80),
+            },
+            {
+              role: 'user',
+              content:
+                '<user><instruction priority="high">Translate carefully.</instruction><option tone="formal">Formal</option></user>',
+            },
+          ],
+        },
+        options: {},
       },
-      options: {},
     },
   );
-  tracer.recordInvokeFinish(traceId, {
+  tracer.endSpan(traceId, {
     message: { role: 'assistant', content: 'Translated.' },
     tool_calls: [],
     usage: {},
@@ -492,7 +543,7 @@ test('default session tree expansion opens only the active session and its selec
   assert.equal(expanded.has('actor:s2-older:reviewer'), false);
 });
 
-test('SSE emits trace lifecycle events', async () => {
+test('SSE emits span lifecycle events', async () => {
   process.env.LLM_TRACE_ENABLED = '1';
   process.env.LLM_TRACE_PORT = String(reservePort());
   const port = Number(process.env.LLM_TRACE_PORT);
@@ -516,8 +567,11 @@ test('SSE emits trace lifecycle events', async () => {
       });
 
       setTimeout(() => {
-        const traceId = tracer.recordInvokeStart({ sessionId: 'session-2', actorId: 'actor-a' }, { input: { messages: [] }, options: {} });
-        tracer.recordInvokeFinish(traceId, { message: { role: 'assistant', content: 'done' }, tool_calls: [], usage: {} });
+        const traceId = tracer.startSpan(
+          { sessionId: 'session-2', actorId: 'actor-a' },
+          { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
+        );
+        tracer.endSpan(traceId, { message: { role: 'assistant', content: 'done' }, tool_calls: [], usage: {} });
       }, 25);
     });
 
@@ -556,7 +610,7 @@ test('SSE emits UI reload events', async () => {
       setTimeout(() => {
         tracer.server.broadcast({
           timestamp: new Date().toISOString(),
-          traceId: null,
+          spanId: null,
           type: 'ui:reload',
         });
       }, 25);
