@@ -1,13 +1,16 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createTraceServer } from './server';
 import { TraceStore } from './store';
 import { maybeStartUIWatcher } from './ui-build';
-import { envFlag, safeClone } from './utils';
+import { envFlag, safeClone, toSpanEventInputFromChunk } from './utils';
 import {
   type ChatModelLike,
   type LocalLLMTracer,
   type OpenAIChatCompletionCreateParamsLike,
   type OpenAIChatCompletionStreamLike,
   type OpenAIClientLike,
+  type SpanEventInput,
+  type SpanStartOptions,
   type TraceConfig,
   type TraceContext,
   type TraceRequest,
@@ -24,6 +27,14 @@ export type {
   OpenAIChatCompletionCreateParamsLike,
   OpenAIChatCompletionStreamLike,
   OpenAIClientLike,
+  SpanAttributes,
+  SpanContext,
+  SpanEvent,
+  SpanEventInput,
+  SpanKind,
+  SpanStartOptions,
+  SpanStatus,
+  SpanStatusCode,
   TraceConfig,
   TraceContext,
   TraceEvent,
@@ -42,6 +53,7 @@ export type {
 
 let singleton: LocalLLMTracerImpl | null = null;
 const DEFAULT_TRACE_PORT = 4319;
+const activeSpanStorage = new AsyncLocalStorage<string | null>();
 
 export function isTraceEnabled(): boolean {
   return envFlag('LLM_TRACE_ENABLED');
@@ -61,28 +73,20 @@ export function startTraceServer(config: TraceConfig = {}) {
   return getLocalLLMTracer(config).startServer();
 }
 
-export function recordInvokeStart(context: TraceContext, request: TraceRequest, config: TraceConfig = {}): string {
-  return getLocalLLMTracer(config).recordInvokeStart(context, request);
+export function startSpan(context: TraceContext, options: SpanStartOptions = {}, config: TraceConfig = {}): string {
+  return getLocalLLMTracer(config).startSpan(context, options);
 }
 
-export function recordInvokeFinish(traceId: string, response: unknown, config: TraceConfig = {}) {
-  getLocalLLMTracer(config).recordInvokeFinish(traceId, response);
+export function endSpan(spanId: string, response: unknown, config: TraceConfig = {}) {
+  getLocalLLMTracer(config).endSpan(spanId, response);
 }
 
-export function recordStreamStart(context: TraceContext, request: TraceRequest, config: TraceConfig = {}): string {
-  return getLocalLLMTracer(config).recordStreamStart(context, request);
+export function addSpanEvent(spanId: string, event: SpanEventInput, config: TraceConfig = {}) {
+  getLocalLLMTracer(config).addSpanEvent(spanId, event);
 }
 
-export function recordStreamChunk(traceId: string, chunk: unknown, config: TraceConfig = {}) {
-  getLocalLLMTracer(config).recordStreamChunk(traceId, chunk);
-}
-
-export function recordStreamFinish(traceId: string, chunk: unknown, config: TraceConfig = {}) {
-  getLocalLLMTracer(config).recordStreamFinish(traceId, chunk);
-}
-
-export function recordError(traceId: string, error: unknown, config: TraceConfig = {}) {
-  getLocalLLMTracer(config).recordError(traceId, error);
+export function recordException(spanId: string, error: unknown, config: TraceConfig = {}) {
+  getLocalLLMTracer(config).recordException(spanId, error);
 }
 
 export function __resetLocalLLMTracerForTests() {
@@ -115,13 +119,18 @@ export function wrapChatModel<
         return model.invoke(input, options);
       }
 
-      const traceId = tracer.recordInvokeStart(getContext ? getContext() : {}, { input: input as any, options: options as any });
+      const traceId = tracer.startSpan(getContext ? getContext() : {}, {
+        attributes: { 'gen_ai.operation.name': 'chat' },
+        mode: 'invoke',
+        name: 'llm.invoke',
+        request: { input: input as any, options: options as any },
+      });
       try {
-        const response = await model.invoke(input, options);
-        tracer.recordInvokeFinish(traceId, response);
+        const response = await tracer.runWithActiveSpan(traceId, () => model.invoke(input, options));
+        tracer.endSpan(traceId, response);
         return response;
       } catch (error) {
-        tracer.recordError(traceId, error);
+        tracer.recordException(traceId, error);
         throw error;
       }
     },
@@ -133,20 +142,25 @@ export function wrapChatModel<
         return;
       }
 
-      const traceId = tracer.recordStreamStart(getContext ? getContext() : {}, { input: input as any, options: options as any });
+      const traceId = tracer.startSpan(getContext ? getContext() : {}, {
+        attributes: { 'gen_ai.operation.name': 'chat' },
+        mode: 'stream',
+        name: 'llm.stream',
+        request: { input: input as any, options: options as any },
+      });
 
       try {
-        const stream = model.stream(input, options);
+        const stream = tracer.runWithActiveSpan(traceId, () => model.stream(input, options));
         for await (const chunk of stream) {
           if ((chunk as any)?.type === 'finish') {
-            tracer.recordStreamFinish(traceId, chunk);
+            tracer.endSpan(traceId, chunk);
           } else {
-            tracer.recordStreamChunk(traceId, chunk);
+            tracer.addSpanEvent(traceId, toSpanEventInputFromChunk(chunk));
           }
           yield chunk;
         }
       } catch (error) {
-        tracer.recordError(traceId, error);
+        tracer.recordException(traceId, error);
         throw error;
       }
     },
@@ -176,25 +190,35 @@ export function wrapOpenAIClient<
           const context = withOpenAITraceContext(getContext ? getContext() : {}, params);
 
           if (params?.stream) {
-            const traceId = tracer.recordStreamStart(context, { input: params as any, options: options as any });
+            const traceId = tracer.startSpan(context, {
+              attributes: { 'gen_ai.operation.name': 'chat' },
+              mode: 'stream',
+              name: 'openai.chat.completions',
+              request: { input: params as any, options: options as any },
+            });
 
             try {
-              const stream = await target.create.call(target, params, options);
+              const stream = await tracer.runWithActiveSpan(traceId, () => target.create.call(target, params, options));
               return wrapOpenAIChatCompletionsStream(stream, tracer, traceId);
             } catch (error) {
-              tracer.recordError(traceId, error);
+              tracer.recordException(traceId, error);
               throw error;
             }
           }
 
-          const traceId = tracer.recordInvokeStart(context, { input: params as any, options: options as any });
+          const traceId = tracer.startSpan(context, {
+            attributes: { 'gen_ai.operation.name': 'chat' },
+            mode: 'invoke',
+            name: 'openai.chat.completions',
+            request: { input: params as any, options: options as any },
+          });
 
           try {
-            const response = await target.create.call(target, params, options);
-            tracer.recordInvokeFinish(traceId, normalizeOpenAIChatCompletionResponse(response));
+            const response = await tracer.runWithActiveSpan(traceId, () => target.create.call(target, params, options));
+            tracer.endSpan(traceId, normalizeOpenAIChatCompletionResponse(response));
             return response;
           } catch (error) {
-            tracer.recordError(traceId, error);
+            tracer.recordException(traceId, error);
             throw error;
           }
         };
@@ -283,6 +307,32 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     return isTraceEnabled();
   }
 
+  startSpan(context: TraceContext, options: SpanStartOptions = {}): string {
+    void this.startServer();
+    const parentSpanId = options.parentSpanId || activeSpanStorage.getStore() || null;
+    return this.store.startSpan(context as any, {
+      ...options,
+      parentSpanId,
+      request: normaliseRequest(options.request || {}),
+    });
+  }
+
+  runWithActiveSpan<T>(spanId: string, callback: () => T): T {
+    return activeSpanStorage.run(spanId, callback);
+  }
+
+  addSpanEvent(spanId: string, event: SpanEventInput) {
+    this.store.addSpanEvent(spanId, safeClone(event));
+  }
+
+  endSpan(spanId: string, response?: unknown) {
+    this.store.endSpan(spanId, safeClone(response));
+  }
+
+  recordException(spanId: string, error: unknown) {
+    this.store.recordException(spanId, error);
+  }
+
   startServer(): Promise<{ host: string; port: number; url: string } | null> {
     if (!this.isEnabled() || this.serverFailed) {
       return Promise.resolve(this.serverInfo);
@@ -305,11 +355,11 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
         this.serverInfo = await this.server.start();
         if (this.serverInfo && !this.uiWatcher) {
           this.uiWatcher = await maybeStartUIWatcher(() => {
-            this.server?.broadcast({
-              timestamp: new Date().toISOString(),
-              traceId: null,
-              type: 'ui:reload',
-            });
+              this.server?.broadcast({
+                timestamp: new Date().toISOString(),
+                spanId: null,
+                type: 'ui:reload',
+              });
           }, this.config.uiHotReload);
         }
         if (!this.loggedUrl && this.serverInfo) {
@@ -327,32 +377,6 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     })();
 
     return this.serverStartPromise;
-  }
-
-  recordInvokeStart(context: TraceContext, request: { input?: Record<string, any>; options?: Record<string, any> }): string {
-    void this.startServer();
-    return this.store.recordInvokeStart(context as any, normaliseRequest(request));
-  }
-
-  recordInvokeFinish(traceId: string, response: unknown) {
-    this.store.recordInvokeFinish(traceId, safeClone(response));
-  }
-
-  recordStreamStart(context: TraceContext, request: { input?: Record<string, any>; options?: Record<string, any> }): string {
-    void this.startServer();
-    return this.store.recordStreamStart(context as any, normaliseRequest(request));
-  }
-
-  recordStreamChunk(traceId: string, chunk: unknown) {
-    this.store.recordStreamChunk(traceId, safeClone(chunk));
-  }
-
-  recordStreamFinish(traceId: string, chunk: unknown) {
-    this.store.recordStreamFinish(traceId, safeClone(chunk));
-  }
-
-  recordError(traceId: string, error: unknown) {
-    this.store.recordError(traceId, error);
   }
 }
 
@@ -417,7 +441,7 @@ function wrapOpenAIChatCompletionsStream<TStream extends OpenAIChatCompletionStr
     state.began = true;
     const nextRole = role || state.role || 'assistant';
     state.role = nextRole;
-    tracer.recordStreamChunk(traceId, { type: 'begin', role: nextRole });
+    tracer.addSpanEvent(traceId, toSpanEventInputFromChunk({ type: 'begin', role: nextRole }));
   };
 
   const emitFinish = () => {
@@ -427,7 +451,7 @@ function wrapOpenAIChatCompletionsStream<TStream extends OpenAIChatCompletionStr
 
     emitBegin(state.role);
     state.finished = true;
-    tracer.recordStreamFinish(traceId, {
+    tracer.endSpan(traceId, {
       type: 'finish',
       finish_reasons: state.finishReasons,
       message: {
@@ -490,24 +514,30 @@ function wrapOpenAIChatCompletionsStream<TStream extends OpenAIChatCompletionStr
     }
 
     if (contentParts.length > 0) {
-      tracer.recordStreamChunk(traceId, {
-        type: 'chunk',
-        content: contentParts.join(''),
+      tracer.addSpanEvent(
+        traceId,
+        toSpanEventInputFromChunk({
+          type: 'chunk',
+          content: contentParts.join(''),
+          finish_reasons: [...finishReasons],
+          raw,
+          tool_calls: chunkToolCalls,
+          usage,
+        }),
+      );
+      return;
+    }
+
+    tracer.addSpanEvent(
+      traceId,
+      toSpanEventInputFromChunk({
+        type: 'event',
         finish_reasons: [...finishReasons],
         raw,
         tool_calls: chunkToolCalls,
         usage,
-      });
-      return;
-    }
-
-    tracer.recordStreamChunk(traceId, {
-      type: 'event',
-      finish_reasons: [...finishReasons],
-      raw,
-      tool_calls: chunkToolCalls,
-      usage,
-    });
+      }),
+    );
   };
 
   const createWrappedIterator = (iterator: AsyncIterator<TChunk>) => ({
@@ -522,7 +552,7 @@ function wrapOpenAIChatCompletionsStream<TStream extends OpenAIChatCompletionStr
         processChunk(result.value);
         return result;
       } catch (error) {
-        tracer.recordError(traceId, error);
+        tracer.recordException(traceId, error);
         throw error;
       }
     },
@@ -539,13 +569,13 @@ function wrapOpenAIChatCompletionsStream<TStream extends OpenAIChatCompletionStr
         emitFinish();
         return result;
       } catch (error) {
-        tracer.recordError(traceId, error);
+        tracer.recordException(traceId, error);
         throw error;
       }
     },
 
     async throw(error?: unknown) {
-      tracer.recordError(traceId, error);
+      tracer.recordException(traceId, error);
 
       if (typeof iterator.throw === 'function') {
         return iterator.throw(error as any);

@@ -190,8 +190,8 @@ type JsonMode = "formatted" | "raw";
 
 type TraceTabModes = Partial<Record<TabId, JsonMode>>;
 type TraceEventPayload = {
-  trace?: TraceRecord;
-  traceId?: string | null;
+  span?: TraceRecord;
+  spanId?: string | null;
   type?: string;
 };
 
@@ -488,44 +488,42 @@ export function App() {
 
   const handleSseMessage = useEffectEvent((data: string) => {
     const payload = parseEvent(data);
+    const nextTrace = payload?.span;
+    const nextTraceId = payload?.spanId;
     if (payload?.type === "ui:reload") {
       window.location.reload();
       return;
     }
 
-    if (
-      payload?.trace &&
-      selectedTraceId &&
-      payload.traceId === selectedTraceId
-    ) {
-      startTransition(() => setDetail(payload.trace as TraceRecord));
+    if (nextTrace && selectedTraceId && nextTraceId === selectedTraceId) {
+      startTransition(() => setDetail(nextTrace as TraceRecord));
     }
 
     if (!queryString) {
-      if (payload?.type === "trace:update" && payload.trace) {
-        applyIncrementalTraceUpdate(payload.trace);
+      if ((payload?.type === "span:update" || payload?.type === "span:end") && nextTrace) {
+        applyIncrementalTraceUpdate(nextTrace);
         return;
       }
 
-      if (payload?.type === "trace:add" && payload.trace) {
-        applyIncrementalTraceAdd(payload.trace);
+      if (payload?.type === "span:start" && nextTrace) {
+        applyIncrementalTraceAdd(nextTrace);
         scheduleRefresh(180);
         return;
       }
 
-      if (payload?.type === "trace:evict") {
-        applyIncrementalTraceEvict(payload.traceId);
+      if (payload?.type === "span:evict") {
+        applyIncrementalTraceEvict(nextTraceId);
         scheduleRefresh(180);
         return;
       }
 
-      if (payload?.type === "trace:clear") {
+      if (payload?.type === "span:clear") {
         clearIncrementalState();
         return;
       }
     }
 
-    scheduleRefresh(payload?.type === "trace:update" ? 700 : 180);
+    scheduleRefresh(payload?.type === "span:update" || payload?.type === "span:end" ? 700 : 180);
   });
 
   useEffect(() => {

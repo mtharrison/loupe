@@ -125,9 +125,28 @@ Supported demo environment variables: `OPENAI_MODEL`, `LLM_TRACE_PORT`, `LOUPE_O
 
 The script tries to open the dashboard automatically and prints the local URL either way. Set `LOUPE_OPEN_BROWSER=0` if you want to suppress the browser launch.
 
+### Runnable Nested Tool-Call Demo
+
+`examples/nested-tool-call.js` is a credential-free demo that:
+
+- starts the Loupe dashboard eagerly
+- wraps a root assistant model and a nested tool model
+- invokes the nested tool model from inside the parent model call
+- shows parent/child spans linked on the same trace
+
+Run it with:
+
+```bash
+npm install
+export LLM_TRACE_ENABLED=1
+node examples/nested-tool-call.js
+```
+
 ## Low-Level Lifecycle API
 
-If you need full control over trace boundaries, Loupe also exposes the lower-level `record*` lifecycle functions.
+If you need full control over trace boundaries, Loupe exposes a lower-level span lifecycle API modeled on OpenTelemetry concepts: start a span, add events, end it, and record exceptions.
+
+Loupe stores GenAI span attributes using the OpenTelemetry semantic convention names where they apply, including `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.system`, `gen_ai.provider.name`, `gen_ai.operation.name`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, and `gen_ai.conversation.id`.
 
 Start the dashboard during app startup, then instrument a model call:
 
@@ -135,9 +154,9 @@ Start the dashboard during app startup, then instrument a model call:
 import {
   getLocalLLMTracer,
   isTraceEnabled,
-  recordError,
-  recordInvokeFinish,
-  recordInvokeStart,
+  endSpan,
+  recordException,
+  startSpan,
   type TraceContext,
 } from '@mtharrison/loupe';
 
@@ -166,51 +185,63 @@ const request = {
   options: {},
 };
 
-const traceId = recordInvokeStart(context, request);
+const spanId = startSpan(context, {
+  mode: 'invoke',
+  name: 'openai.chat.completions',
+  request,
+});
 
 try {
   const response = await model.invoke(request.input, request.options);
-  recordInvokeFinish(traceId, response);
+  endSpan(spanId, response);
   return response;
 } catch (error) {
-  recordError(traceId, error);
+  recordException(spanId, error);
   throw error;
 }
 ```
 
 ### Streaming
 
-Streaming works the same way. Loupe records each chunk event, first-chunk latency, and the reconstructed final response.
+Streaming works the same way. Loupe records each span event, first-chunk latency, and the reconstructed final response.
 
 ```ts
 import {
-  recordError,
-  recordStreamChunk,
-  recordStreamFinish,
-  recordStreamStart,
+  addSpanEvent,
+  endSpan,
+  recordException,
+  startSpan,
 } from '@mtharrison/loupe';
 
-const traceId = recordStreamStart(context, request);
+const spanId = startSpan(context, {
+  mode: 'stream',
+  name: 'openai.chat.completions',
+  request,
+});
 
 try {
   for await (const chunk of model.stream(request.input, request.options)) {
     if (chunk?.type === 'finish') {
-      recordStreamFinish(traceId, chunk);
+      endSpan(spanId, chunk);
     } else {
-      recordStreamChunk(traceId, chunk);
+      addSpanEvent(spanId, {
+        name: `stream.${chunk?.type || 'event'}`,
+        attributes: chunk,
+        payload: chunk,
+      });
     }
 
     yield chunk;
   }
 } catch (error) {
-  recordError(traceId, error);
+  recordException(spanId, error);
   throw error;
 }
 ```
 
 ## Trace Context
 
-Loupe gets its hierarchy and filters from the context you pass to `recordInvokeStart()` and `recordStreamStart()`.
+Loupe gets its hierarchy and filters from the context you pass to `startSpan()`.
 
 ### Generic context fields
 
@@ -322,7 +353,7 @@ Programmatic configuration is also available through `getLocalLLMTracer(config)`
 
 ## API
 
-Loupe exposes both low-level lifecycle functions and lightweight wrappers.
+Loupe exposes both low-level span lifecycle functions and lightweight wrappers.
 
 ### `isTraceEnabled()`
 
@@ -340,29 +371,21 @@ Returns the singleton tracer instance. This is useful if you want to:
 
 Starts the local dashboard server eagerly instead of waiting for the first trace.
 
-### `recordInvokeStart(context, request, config?)`
+### `startSpan(context, options?, config?)`
 
-Creates an `invoke` trace and returns a `traceId`.
+Creates a span and returns its Loupe `spanId`. Pass `mode`, `name`, and `request` in `options` to describe the operation. Nested spans are linked automatically when wrapped calls invoke other wrapped calls in the same async flow.
 
-### `recordInvokeFinish(traceId, response, config?)`
+### `addSpanEvent(spanId, event, config?)`
 
-Marks an `invoke` trace as complete and stores the response payload.
+Appends an event to an existing span. For streaming traces, pass the raw chunk as `event.payload` to preserve chunk reconstruction in the UI.
 
-### `recordStreamStart(context, request, config?)`
+### `endSpan(spanId, response, config?)`
 
-Creates a `stream` trace and returns a `traceId`.
+Marks a span as complete and stores the final response payload.
 
-### `recordStreamChunk(traceId, chunk, config?)`
+### `recordException(spanId, error, config?)`
 
-Appends a non-final stream chunk to an existing trace.
-
-### `recordStreamFinish(traceId, chunk, config?)`
-
-Stores the final stream payload and marks the trace complete.
-
-### `recordError(traceId, error, config?)`
-
-Marks a trace as failed and stores a serialized error payload.
+Marks a span as failed and stores a serialized exception payload.
 
 All of these functions forward to the singleton tracer returned by `getLocalLLMTracer()`.
 

@@ -1,8 +1,13 @@
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   type HierarchyNode,
   type HierarchyResponse,
   type NormalizedTraceContext,
+  type SpanAttributes,
+  type SpanEvent,
+  type SpanEventInput,
+  type SpanStartOptions,
   type TraceEvent,
   type TraceFilters,
   type TraceListResponse,
@@ -10,11 +15,13 @@ import {
   type TraceRequest,
   type TraceSummary,
 } from './types';
-import { getTraceInsights, getUsageCostUsd, normalizeTraceContext, safeClone, sanitizeHeaders, toErrorPayload, toSummary } from './utils';
+import { getTraceInsights, getUsageCostUsd, normalizeTraceContext, safeClone, sanitizeHeaders, toErrorPayload, toSpanEventInputFromChunk, toSummary } from './utils';
 
 type MutableHierarchyNode = Omit<HierarchyNode, 'children'> & {
   children: Map<string, MutableHierarchyNode>;
 };
+
+const STREAM_EVENT_NAME_PREFIX = 'stream.';
 
 export class TraceStore extends EventEmitter {
   maxTraces: number;
@@ -28,86 +35,113 @@ export class TraceStore extends EventEmitter {
     this.traces = new Map();
   }
 
-  recordInvokeStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
-    return this.recordStart('invoke', context, request);
+  startSpan(context: NormalizedTraceContext | undefined, options: SpanStartOptions = {}): string {
+    return this.recordStart(options.mode || 'invoke', context, options.request || {}, options);
   }
 
-  recordInvokeFinish(traceId: string, response: any) {
-    const trace = this.traces.get(traceId);
+  addSpanEvent(spanId: string, event: SpanEventInput) {
+    // Loupe returns its own stable span handle from startSpan(). That handle is used to
+    // look up mutable in-memory records here, while trace.spanContext.spanId stores the
+    // OpenTelemetry span ID exposed on the resulting span data.
+    const trace = this.traces.get(spanId);
     if (!trace) {
       return;
     }
 
-    trace.response = safeClone(response);
-    trace.usage = safeClone(response?.usage);
-    trace.status = 'ok';
-    trace.endedAt = new Date().toISOString();
-    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
+    const spanEvent = normalizeSpanEvent(event);
+    trace.events.push(spanEvent);
+    this.applyStreamPayload(trace, event.payload, spanEvent);
+    this.publish('span:update', spanId, { trace: this.cloneTrace(trace) });
   }
 
-  recordStreamStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
-    return this.recordStart('stream', context, request);
-  }
-
-  recordStreamChunk(traceId: string, chunk: any) {
-    const trace = this.traces.get(traceId);
-    if (!trace || !trace.stream) {
+  endSpan(spanId: string, response: any) {
+    const trace = this.traces.get(spanId);
+    if (!trace) {
       return;
     }
 
-    const clone = safeClone(chunk);
+    const clone = safeClone(response);
+    if (trace.mode === 'stream') {
+      const finishEvent = normalizeSpanEvent(toSpanEventInputFromChunk(clone));
+      trace.events.push(finishEvent);
+      this.applyStreamPayload(trace, clone, finishEvent);
+      trace.response = clone;
+      trace.usage = safeClone(clone?.usage);
+    } else {
+      trace.response = clone;
+      trace.usage = safeClone(clone?.usage);
+    }
+
+    applyResponseAttributes(trace, clone);
+    trace.status = 'ok';
+    trace.spanStatus = { code: 'OK' };
+    trace.endedAt = new Date().toISOString();
+    this.publish('span:end', spanId, { trace: this.cloneTrace(trace) });
+  }
+
+  recordException(spanId: string, error: unknown) {
+    const trace = this.traces.get(spanId);
+    if (!trace) {
+      return;
+    }
+
+    const payload = toErrorPayload(error);
+    trace.error = payload;
+    trace.events.push({
+      attributes: payload || {},
+      name: 'exception',
+      timestamp: new Date().toISOString(),
+    });
+    trace.status = 'error';
+    trace.spanStatus = {
+      code: 'ERROR',
+      message: payload?.message,
+    };
+    if (payload?.name || payload?.type || payload?.code || payload?.status) {
+      trace.attributes['error.type'] = String(payload.name || payload.type || payload.code || payload.status);
+    }
+    trace.endedAt = new Date().toISOString();
+    this.publish('span:end', spanId, { trace: this.cloneTrace(trace) });
+  }
+
+  private applyStreamPayload(trace: TraceRecord, payload: unknown, spanEvent: SpanEvent) {
+    if (!trace.stream) {
+      return;
+    }
+
+    const clone = toStreamPayload(payload, spanEvent);
     if (clone && typeof clone === 'object') {
       clone.offsetMs = Math.max(0, Date.now() - Date.parse(trace.startedAt));
     }
     trace.stream.events.push(clone);
 
-    if (chunk?.type === 'chunk') {
+    if (clone?.type === 'chunk') {
       trace.stream.chunkCount += 1;
       if (trace.stream.firstChunkMs === null) {
         trace.stream.firstChunkMs = Date.now() - Date.parse(trace.startedAt);
       }
 
-      if (typeof chunk.content === 'string') {
-        trace.stream.reconstructed.message.content = `${trace.stream.reconstructed.message.content || ''}${chunk.content}`;
+      if (typeof clone.content === 'string') {
+        trace.stream.reconstructed.message.content = `${trace.stream.reconstructed.message.content || ''}${clone.content}`;
       }
     }
 
-    if (chunk?.type === 'begin') {
-      trace.stream.reconstructed.message.role = chunk.role;
+    if (clone?.type === 'begin') {
+      trace.stream.reconstructed.message.role = clone.role;
     }
 
-    if (chunk?.type === 'finish') {
+    if (clone?.type === 'finish') {
       trace.response = clone;
-      trace.usage = safeClone(chunk.usage);
+      trace.usage = safeClone(clone.usage);
       trace.stream.reconstructed.message = {
-        ...(safeClone(chunk.message) || {}),
+        ...(safeClone(clone.message) || {}),
         content:
           trace.stream.reconstructed.message.content ||
-          (typeof chunk.message?.content === 'string' ? chunk.message.content : chunk.message?.content ?? null),
+          (typeof clone.message?.content === 'string' ? clone.message.content : clone.message?.content ?? null),
       };
-      trace.stream.reconstructed.tool_calls = safeClone(chunk.tool_calls || []);
-      trace.stream.reconstructed.usage = safeClone(chunk.usage || null);
-      trace.status = 'ok';
-      trace.endedAt = new Date().toISOString();
+      trace.stream.reconstructed.tool_calls = safeClone(clone.tool_calls || []);
+      trace.stream.reconstructed.usage = safeClone(clone.usage || null);
     }
-
-    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
-  }
-
-  recordStreamFinish(traceId: string, chunk: any) {
-    this.recordStreamChunk(traceId, chunk);
-  }
-
-  recordError(traceId: string, error: unknown) {
-    const trace = this.traces.get(traceId);
-    if (!trace) {
-      return;
-    }
-
-    trace.error = toErrorPayload(error);
-    trace.status = 'error';
-    trace.endedAt = new Date().toISOString();
-    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
   }
 
   list(filters: TraceFilters = {}): TraceListResponse {
@@ -133,7 +167,7 @@ export class TraceStore extends EventEmitter {
   clear() {
     this.order = [];
     this.traces.clear();
-    this.publish('trace:clear', null, {});
+    this.publish('span:clear', null, {});
   }
 
   hierarchy(filters: TraceFilters = {}): HierarchyResponse {
@@ -226,19 +260,29 @@ export class TraceStore extends EventEmitter {
     };
   }
 
-  private recordStart(mode: TraceRecord['mode'], context: NormalizedTraceContext | undefined, request: TraceRequest): string {
+  private recordStart(
+    mode: TraceRecord['mode'],
+    context: NormalizedTraceContext | undefined,
+    request: TraceRequest,
+    options: Pick<SpanStartOptions, 'attributes' | 'kind' | 'name' | 'parentSpanId'> = {},
+  ): string {
     const traceContext = normalizeTraceContext(context as any, mode);
     const traceId = randomId();
+    const parentSpan = options.parentSpanId ? this.traces.get(options.parentSpanId) : null;
     const startedAt = new Date().toISOString();
     const trace: TraceRecord = {
+      attributes: buildSpanAttributes(traceContext, mode, request, options.attributes),
       context: traceContext,
       endedAt: null,
       error: null,
+      events: [],
       hierarchy: traceContext.hierarchy,
       id: traceId,
       kind: traceContext.kind,
       mode,
       model: traceContext.model,
+      name: options.name || getDefaultSpanName(traceContext, mode),
+      parentSpanId: parentSpan?.spanContext.spanId || options.parentSpanId || null,
       provider: traceContext.provider,
       request: {
         input: safeClone(request?.input),
@@ -249,6 +293,15 @@ export class TraceStore extends EventEmitter {
       },
       response: null,
       startedAt,
+      spanContext: {
+        // The returned Loupe span handle (trace.id) is used for local mutation and SSE updates.
+        // spanContext contains the OpenTelemetry trace/span identifiers that are attached to
+        // the exported span payload and inherited by child spans.
+        spanId: randomHexId(16),
+        traceId: parentSpan?.spanContext.traceId || randomHexId(32),
+      },
+      spanKind: options.kind || 'CLIENT',
+      spanStatus: { code: 'UNSET' },
       status: 'pending',
       stream:
         mode === 'stream'
@@ -270,7 +323,7 @@ export class TraceStore extends EventEmitter {
     this.order.push(traceId);
     this.traces.set(traceId, trace);
     this.evictIfNeeded();
-    this.publish('trace:add', traceId, { trace: this.cloneTrace(trace) });
+    this.publish('span:start', traceId, { trace: this.cloneTrace(trace) });
 
     return traceId;
   }
@@ -282,7 +335,7 @@ export class TraceStore extends EventEmitter {
       if (oldest) {
         this.traces.delete(oldest);
       }
-      this.publish('trace:evict', oldest || null, removed ? { trace: this.cloneTrace(removed) } : {});
+      this.publish('span:evict', oldest || null, removed ? { trace: this.cloneTrace(removed) } : {});
     }
   }
 
@@ -351,8 +404,9 @@ export class TraceStore extends EventEmitter {
 
   private publish(type: string, traceId: string | null, payload: { trace?: TraceRecord }) {
     const event: TraceEvent = {
+      span: payload.trace,
+      spanId: traceId,
       type,
-      traceId,
       timestamp: new Date().toISOString(),
       ...payload,
     };
@@ -476,4 +530,139 @@ function buildGroupHierarchy(traces: TraceRecord[], groupBy: string): HierarchyN
 
 function randomId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function randomHexId(length: number): string {
+  if (length % 2 !== 0) {
+    throw new RangeError(`OpenTelemetry hex IDs must have an even length. Received: ${length}`);
+  }
+
+  return randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
+}
+
+function normalizeSpanEvent(event: SpanEventInput): SpanEvent {
+  const attributes = safeClone(event.attributes || {});
+  if (event.name === 'stream.finish') {
+    attributes['gen_ai.message.status'] = attributes['gen_ai.message.status'] || 'completed';
+  } else if (event.name.startsWith(STREAM_EVENT_NAME_PREFIX)) {
+    attributes['gen_ai.message.status'] = attributes['gen_ai.message.status'] || 'in_progress';
+  }
+  if (attributes.finish_reasons && attributes['gen_ai.response.finish_reasons'] === undefined) {
+    attributes['gen_ai.response.finish_reasons'] = safeClone(attributes.finish_reasons);
+  }
+  if (attributes.message && attributes['gen_ai.output.messages'] === undefined) {
+    attributes['gen_ai.output.messages'] = [safeClone(attributes.message)];
+  }
+  return {
+    attributes,
+    name: event.name,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function toStreamPayload(payload: unknown, spanEvent: SpanEvent): Record<string, any> {
+  if (payload && typeof payload === 'object') {
+    return safeClone(payload as Record<string, any>);
+  }
+
+  // Generic addSpanEvent() callers may only provide an OpenTelemetry-style event name
+  // plus attributes. Reconstruct the minimal legacy stream payload shape from that data
+  // so the existing dashboard stream timeline can continue to render incrementally.
+  const suffix = spanEvent.name.startsWith(STREAM_EVENT_NAME_PREFIX)
+    ? spanEvent.name.slice(STREAM_EVENT_NAME_PREFIX.length)
+    : spanEvent.name;
+  const eventType = suffix || 'event';
+  return {
+    ...safeClone(spanEvent.attributes || {}),
+    type: eventType,
+  };
+}
+
+function getDefaultSpanName(context: NormalizedTraceContext, mode: TraceRecord['mode']): string {
+  const prefix = context.provider || 'llm';
+  return `${prefix}.${mode}`;
+}
+
+function buildSpanAttributes(
+  context: NormalizedTraceContext,
+  mode: TraceRecord['mode'],
+  request: TraceRequest,
+  extraAttributes: SpanAttributes | undefined,
+): SpanAttributes {
+  const base: SpanAttributes = {
+    'gen_ai.conversation.id': context.sessionId || undefined,
+    'gen_ai.input.messages': Array.isArray(request?.input?.messages) ? safeClone(request.input.messages) : undefined,
+    'gen_ai.operation.name': inferGenAIOperationName(request, mode),
+    'gen_ai.provider.name': context.provider || undefined,
+    'gen_ai.request.choice.count': typeof request?.input?.n === 'number' ? request.input.n : undefined,
+    'gen_ai.request.model': (typeof request?.input?.model === 'string' && request.input.model) || context.model || undefined,
+    'gen_ai.system': context.provider || undefined,
+    'loupe.actor.id': context.actorId || undefined,
+    'loupe.actor.type': context.actorType || undefined,
+    'loupe.guardrail.phase': context.guardrailPhase || undefined,
+    'loupe.guardrail.type': context.guardrailType || undefined,
+    'loupe.root_actor.id': context.rootActorId || undefined,
+    'loupe.root_session.id': context.rootSessionId || undefined,
+    'loupe.session.id': context.sessionId || undefined,
+    'loupe.stage': context.stage || undefined,
+    'loupe.tenant.id': context.tenantId || undefined,
+    'loupe.user.id': context.userId || undefined,
+  };
+
+  for (const [key, value] of Object.entries(context.tags || {})) {
+    base[`loupe.tag.${key}`] = value;
+  }
+
+  return Object.fromEntries(
+    Object.entries({
+      ...base,
+      ...(extraAttributes || {}),
+    }).filter(([, value]) => value !== undefined && value !== null),
+  );
+}
+
+function applyResponseAttributes(trace: TraceRecord, response: any) {
+  const finishReasons = Array.isArray(response?.finish_reasons)
+    ? response.finish_reasons
+    : response?.finish_reason
+      ? [response.finish_reason]
+      : [];
+  const usage = response?.usage;
+
+  if (typeof response?.model === 'string' && response.model) {
+    trace.attributes['gen_ai.response.model'] = response.model;
+  }
+  if (usage?.tokens?.prompt !== undefined) {
+    trace.attributes['gen_ai.usage.input_tokens'] = usage.tokens.prompt;
+  }
+  if (usage?.tokens?.completion !== undefined) {
+    trace.attributes['gen_ai.usage.output_tokens'] = usage.tokens.completion;
+  }
+  if (finishReasons.length > 0) {
+    trace.attributes['gen_ai.response.finish_reasons'] = safeClone(finishReasons);
+  }
+  if (response?.message) {
+    trace.attributes['gen_ai.output.messages'] = [safeClone(response.message)];
+    trace.attributes['gen_ai.output.type'] = inferGenAIOutputType(response.message.content);
+  }
+}
+
+function inferGenAIOperationName(request: TraceRequest, mode: TraceRecord['mode']): string {
+  if (Array.isArray(request?.input?.messages) && request.input.messages.length > 0) {
+    return 'chat';
+  }
+
+  return mode;
+}
+
+function inferGenAIOutputType(content: unknown): string {
+  if (typeof content === 'string' || Array.isArray(content)) {
+    return 'text';
+  }
+
+  if (content && typeof content === 'object') {
+    return 'json';
+  }
+
+  return 'unknown';
 }

@@ -1,5 +1,6 @@
 import {
   type NormalizedTraceContext,
+  type SpanEventInput,
   type TraceContext,
   type TraceHighlightInsight,
   type TraceInsights,
@@ -28,6 +29,22 @@ export function safeClone<T>(value: T): T {
   } catch (_err) {
     return value;
   }
+}
+
+export function toSpanEventInputFromChunk(chunk: unknown): SpanEventInput {
+  const payload = safeClone(chunk) as Record<string, any> | null;
+  const eventType = typeof payload?.type === 'string' && payload.type ? payload.type : 'event';
+  const attributes = payload !== null && typeof payload === 'object' ? { ...payload } : {};
+
+  if ('type' in attributes) {
+    delete attributes.type;
+  }
+
+  return {
+    attributes,
+    name: `stream.${eventType}`,
+    payload: payload ?? undefined,
+  };
 }
 
 export function toErrorPayload(error: any): Record<string, any> | null {
