@@ -181,75 +181,56 @@ export class TraceStore extends EventEmitter {
     }
 
     const roots = new Map<string, MutableHierarchyNode>();
+    const traceBySpanId = new Map<string, TraceRecord>();
+    const traceNodeByTraceId = new Map<string, MutableHierarchyNode>();
+    const traceSessionByTraceId = new Map<string, string>();
+    const parentNodeById = new Map<string, MutableHierarchyNode>();
 
     for (const trace of traces) {
-      const sessionId = trace.hierarchy.sessionId || 'unknown-session';
+      const sessionId = getTraceSessionId(trace);
       const sessionNode = getOrCreateNode(roots, `session:${sessionId}`, 'session', `Session ${sessionId}`, {
         sessionId,
         chatId: trace.hierarchy.chatId,
-      });
-      const lineage = [sessionNode];
-
-      const rootActorId = trace.hierarchy.rootActorId || 'unknown-actor';
-      const actorNode = getOrCreateNode(sessionNode.children, `actor:${sessionId}:${rootActorId}`, 'actor', rootActorId, {
-        actorId: rootActorId,
-        rootActorId,
-        sessionId,
+        rootActorId: trace.hierarchy.rootActorId,
         topLevelAgentId: trace.hierarchy.topLevelAgentId,
       });
-      lineage.push(actorNode);
-
-      let currentNode = actorNode;
-
-      if (trace.hierarchy.kind === 'guardrail') {
-        const label = `${trace.hierarchy.guardrailPhase || 'guardrail'} guardrail`;
-        currentNode = getOrCreateNode(
-          currentNode.children,
-          `guardrail:${sessionId}:${rootActorId}:${trace.context.guardrailType || label}`,
-          'guardrail',
-          label,
-          {
-            guardrailPhase: trace.hierarchy.guardrailPhase || null,
-            guardrailType: trace.context.guardrailType || null,
-            systemType: trace.context.systemType || null,
-            watchdogPhase: trace.hierarchy.watchdogPhase || null,
-          },
-        );
-        lineage.push(currentNode);
-      } else if (trace.hierarchy.childActorId) {
-        currentNode = getOrCreateNode(
-          currentNode.children,
-          `child-actor:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId}`,
-          'child-actor',
-          trace.hierarchy.childActorId,
-          {
-            actorId: trace.hierarchy.childActorId,
-            childActorId: trace.hierarchy.childActorId,
-            delegatedAgentId: trace.hierarchy.delegatedAgentId,
-          },
-        );
-        lineage.push(currentNode);
-      }
-
-      if (trace.hierarchy.stage) {
-        currentNode = getOrCreateNode(
-          currentNode.children,
-          `stage:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId || 'root'}:${trace.hierarchy.stage}`,
-          'stage',
-          trace.hierarchy.stage,
-          {
-            stage: trace.hierarchy.stage,
-            workflowState: trace.hierarchy.workflowState,
-          },
-        );
-        lineage.push(currentNode);
-      }
-
       const traceNode = createTraceNode(trace);
-      currentNode.children.set(traceNode.id, traceNode);
+      traceBySpanId.set(trace.spanContext.spanId, trace);
+      traceNodeByTraceId.set(trace.id, traceNode);
+      traceSessionByTraceId.set(trace.id, sessionId);
+    }
 
-      for (const node of new Set(lineage)) {
-        applyTraceRollup(node, trace);
+    for (const trace of traces) {
+      const sessionId = traceSessionByTraceId.get(trace.id) || 'unknown-session';
+      const sessionNode = roots.get(`session:${sessionId}`);
+      const traceNode = traceNodeByTraceId.get(trace.id);
+      if (!sessionNode || !traceNode) {
+        continue;
+      }
+
+      const parentTrace = trace.parentSpanId ? traceBySpanId.get(trace.parentSpanId) : null;
+      const parentTraceNode =
+        parentTrace &&
+        traceSessionByTraceId.get(parentTrace.id) === sessionId &&
+        parentTrace.id !== trace.id
+          ? traceNodeByTraceId.get(parentTrace.id) || null
+          : null;
+      parentNodeById.set(traceNode.id, parentTraceNode || sessionNode);
+    }
+
+    for (const trace of traces) {
+      const traceNode = traceNodeByTraceId.get(trace.id);
+      const parentNode = traceNode ? parentNodeById.get(traceNode.id) || null : null;
+      if (!traceNode || !parentNode) {
+        continue;
+      }
+
+      parentNode.children.set(traceNode.id, traceNode);
+
+      let currentNode = parentNode;
+      while (currentNode) {
+        applyTraceRollup(currentNode, trace);
+        currentNode = parentNodeById.get(currentNode.id) || null;
       }
     }
 
@@ -266,9 +247,9 @@ export class TraceStore extends EventEmitter {
     request: TraceRequest,
     options: Pick<SpanStartOptions, 'attributes' | 'kind' | 'name' | 'parentSpanId'> = {},
   ): string {
-    const traceContext = normalizeTraceContext(context as any, mode);
+    const traceContext = applyConversationIdToContext(normalizeTraceContext(context as any, mode), options.attributes);
     const traceId = randomId();
-    const parentSpan = options.parentSpanId ? this.traces.get(options.parentSpanId) : null;
+    const parentSpan = this.findTraceBySpanReference(options.parentSpanId);
     const startedAt = new Date().toISOString();
     const trace: TraceRecord = {
       attributes: buildSpanAttributes(traceContext, mode, request, options.attributes),
@@ -326,6 +307,25 @@ export class TraceStore extends EventEmitter {
     this.publish('span:start', traceId, { trace: this.cloneTrace(trace) });
 
     return traceId;
+  }
+
+  private findTraceBySpanReference(spanReference: string | null | undefined): TraceRecord | null {
+    if (!spanReference) {
+      return null;
+    }
+
+    const byTraceId = this.traces.get(spanReference);
+    if (byTraceId) {
+      return byTraceId;
+    }
+
+    for (const trace of this.traces.values()) {
+      if (trace.spanContext.spanId === spanReference) {
+        return trace;
+      }
+    }
+
+    return null;
   }
 
   private evictIfNeeded() {
@@ -528,6 +528,41 @@ function buildGroupHierarchy(traces: TraceRecord[], groupBy: string): HierarchyN
   return [...groups.values()].map(serialiseNode);
 }
 
+function getTraceSessionId(trace: TraceRecord): string {
+  const conversationId = toNonEmptyString(trace.attributes?.['gen_ai.conversation.id']);
+  return conversationId || trace.hierarchy.sessionId || 'unknown-session';
+}
+
+function applyConversationIdToContext(
+  context: NormalizedTraceContext,
+  extraAttributes: SpanAttributes | undefined,
+): NormalizedTraceContext {
+  const conversationId = toNonEmptyString(extraAttributes?.['gen_ai.conversation.id']);
+  if (!conversationId || conversationId === context.sessionId) {
+    return context;
+  }
+
+  return {
+    ...context,
+    sessionId: conversationId,
+    chatId: conversationId,
+    rootSessionId: context.rootSessionId || conversationId,
+    rootChatId: context.rootChatId || conversationId,
+    tags: {
+      ...context.tags,
+      sessionId: conversationId,
+      chatId: conversationId,
+      rootSessionId: context.rootSessionId || conversationId,
+      rootChatId: context.rootChatId || conversationId,
+    },
+    hierarchy: {
+      ...context.hierarchy,
+      sessionId: conversationId,
+      chatId: conversationId,
+    },
+  };
+}
+
 function randomId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -581,6 +616,10 @@ function toStreamPayload(payload: unknown, spanEvent: SpanEvent): Record<string,
 function getDefaultSpanName(context: NormalizedTraceContext, mode: TraceRecord['mode']): string {
   const prefix = context.provider || 'llm';
   return `${prefix}.${mode}`;
+}
+
+function toNonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function buildSpanAttributes(

@@ -144,6 +144,7 @@ export function getDefaultExpandedSessionTreeNodeIds(
   sessionNodes: SessionNavHierarchyNode[],
   activeSessionId: string | null,
   selectedNodeId: string | null,
+  selectedTraceId: string | null = null,
 ): Set<string> {
   const expanded = new Set<string>();
   const activeSession =
@@ -167,6 +168,17 @@ export function getDefaultExpandedSessionTreeNodeIds(
 
   if (selectedNodeId) {
     for (const node of findSessionNodePath([activeSession], selectedNodeId)) {
+      if (node.children.length) {
+        expanded.add(node.id);
+      }
+    }
+  }
+
+  if (selectedTraceId) {
+    for (const node of findSessionNodePath(
+      [activeSession],
+      `trace:${selectedTraceId}`,
+    )) {
       if (node.children.length) {
         expanded.add(node.id);
       }

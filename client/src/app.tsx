@@ -591,8 +591,11 @@ export function App() {
     [sessionNodes, selectedTraceId],
   );
   const selectedPathIds = useMemo(
-    () => new Set(selectedNodePath.map((node) => node.id)),
-    [selectedNodePath],
+    () =>
+      new Set(
+        [...selectedNodePath, ...selectedTracePath].map((node) => node.id),
+      ),
+    [selectedNodePath, selectedTracePath],
   );
   const selectedSessionNode = useMemo(
     () =>
@@ -669,8 +672,9 @@ export function App() {
         sessionNodes,
         selectedSessionNode?.id ?? null,
         selectedNodeId,
+        selectedTraceId,
       ),
-    [selectedNodeId, selectedSessionNode, sessionNodes],
+    [selectedNodeId, selectedSessionNode, selectedTraceId, sessionNodes],
   );
   const activeTabJsonMode = tabModes[detailTab] ?? "formatted";
   const activeTagFilterCount = countTagFilters(filters.tags);
@@ -784,9 +788,11 @@ export function App() {
     }
 
     const nextTraceId =
-      selectedTraceId && node.traceIds.includes(selectedTraceId)
-        ? selectedTraceId
-        : getNewestTraceIdForNode(node);
+      node.type === "trace"
+        ? (node.meta.traceId ?? node.traceIds[0] ?? null)
+        : selectedTraceId && node.traceIds.includes(selectedTraceId)
+          ? selectedTraceId
+          : getNewestTraceIdForNode(node);
 
     startTransition(() => {
       setSelectedNodeId(nodeId);
@@ -974,6 +980,9 @@ export function App() {
                 <TraceDetailPanel
                   activeTab={activeTab}
                   detail={detail}
+                  detailPath={
+                    selectedTracePath.length ? selectedTracePath : selectedNodePath
+                  }
                   detailTabs={detailTabs}
                   fallbackTrace={selectedTraceSummary}
                   jsonMode={activeTabJsonMode}
@@ -992,6 +1001,7 @@ export function App() {
                       }));
                     })
                   }
+                  traceById={traceById}
                 />
               ) : (
                 <CardContent className="content-scroll">
@@ -1260,16 +1270,24 @@ function HierarchyTreeNode({
 
   if (node.type === "trace" && trace) {
     return (
-      <TraceHierarchyLeaf
+      <TraceHierarchyNode
+        defaultExpandedNodeIds={defaultExpandedNodeIds}
         depth={depth}
+        expandedNodeOverrides={expandedNodeOverrides}
         maxDurationMs={maxDurationMs}
         node={node}
         nodeCopy={nodeCopy}
         onSelect={onSelect}
+        onToggle={onToggle}
         inPath={isInPath}
+        isExpanded={isExpanded}
         selected={selectedNodeId === node.id}
+        selectedNodeId={selectedNodeId}
+        selectedPathIds={selectedPathIds}
         selectedTrace={selectedTraceId === trace.id}
+        selectedTraceId={selectedTraceId}
         trace={trace}
+        traceById={traceById}
       />
     );
   }
@@ -1533,27 +1551,45 @@ function SessionHierarchyBranch({
   );
 }
 
-function TraceHierarchyLeaf({
+function TraceHierarchyNode({
+  defaultExpandedNodeIds,
   depth,
+  expandedNodeOverrides,
   inPath,
+  isExpanded,
   maxDurationMs,
   node,
   nodeCopy,
   onSelect,
+  onToggle,
   selected,
+  selectedNodeId,
+  selectedPathIds,
   selectedTrace,
+  selectedTraceId,
   trace,
+  traceById,
 }: {
+  defaultExpandedNodeIds: Set<string>;
   depth: number;
+  expandedNodeOverrides: Record<string, boolean>;
   inPath: boolean;
+  isExpanded: boolean;
   maxDurationMs: number;
   node: HierarchyNode;
   nodeCopy: { badge: string; label: string; meta: string };
   onSelect: (node: HierarchyNode) => void;
+  onToggle: (id: string) => void;
   selected: boolean;
+  selectedNodeId: string | null;
+  selectedPathIds: Set<string>;
   selectedTrace: boolean;
+  selectedTraceId: string | null;
   trace: TraceSummary;
+  traceById: Map<string, TraceSummary>;
 }) {
+  const isExpandable = node.children.length > 0;
+
   return (
     <div
       className="tree-node-wrap tree-trace-wrap"
@@ -1567,6 +1603,23 @@ function TraceHierarchyLeaf({
           selectedTrace && "is-detail-trace",
         )}
       >
+        <button
+          type="button"
+          className={clsx("tree-node-toggle", !isExpandable && "is-static")}
+          disabled={!isExpandable}
+          onClick={() => {
+            if (isExpandable) {
+              onToggle(node.id);
+            }
+          }}
+          aria-label={
+            isExpandable
+              ? `${isExpanded ? "Collapse" : "Expand"} ${nodeCopy.label}`
+              : undefined
+          }
+        >
+          <ChevronRight className={clsx(isExpanded && "is-open")} />
+        </button>
         <button
           type="button"
           className="tree-node-select tree-trace-select"
@@ -1591,6 +1644,27 @@ function TraceHierarchyLeaf({
           />
         </button>
       </div>
+      {isExpanded ? (
+        <div className="tree-node-children">
+          {node.children.map((child) => (
+            <HierarchyTreeNode
+              key={child.id}
+              defaultExpandedNodeIds={defaultExpandedNodeIds}
+              depth={depth + 1}
+              expandedNodeOverrides={expandedNodeOverrides}
+              maxDurationMs={maxDurationMs}
+              node={child}
+              onSelect={onSelect}
+              onToggle={onToggle}
+              selectedNodeId={selectedNodeId}
+              selectedPathIds={selectedPathIds}
+              selectedTraceId={selectedTraceId}
+              sessionNavById={sessionNavById}
+              traceById={traceById}
+            />
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1973,6 +2047,7 @@ function HierarchyTimelineRows({
 function TraceDetailPanel({
   activeTab,
   detail,
+  detailPath,
   detailTabs,
   fallbackTrace,
   jsonMode,
@@ -1982,9 +2057,11 @@ function TraceDetailPanel({
   onNavigateHierarchyNode,
   onTabChange,
   onToggleJsonMode,
+  traceById,
 }: {
   activeTab: TabId;
   detail: TraceRecord | null;
+  detailPath: HierarchyNode[];
   detailTabs: Array<{ id: TabId; label: string }>;
   fallbackTrace: TraceSummary | null;
   jsonMode: JsonMode;
@@ -1994,14 +2071,17 @@ function TraceDetailPanel({
   onNavigateHierarchyNode: (nodeId: string) => void;
   onTabChange: (value: string) => void;
   onToggleJsonMode: (tabId: TabId) => void;
+  traceById: Map<string, TraceSummary>;
 }) {
   const traceDetailPrimaryRef = useRef<HTMLDivElement | null>(null);
   const [showInlineContextRail, setShowInlineContextRail] = useState(false);
-  const detailCopy = detail
-    ? getTraceDisplayCopy(detail)
-    : fallbackTrace
-      ? getTraceDisplayCopy(fallbackTrace)
-      : null;
+  const detailCopy = detailPath.length
+    ? getHierarchyPathDisplayCopy(detailPath, traceById)
+    : detail
+      ? getTraceDisplayCopy(detail)
+      : fallbackTrace
+        ? getTraceDisplayCopy(fallbackTrace)
+        : null;
   const detailStatus = detail?.status ?? fallbackTrace?.status ?? null;
   const detailDuration = detail
     ? formatTraceDuration(detail)
@@ -3807,8 +3887,8 @@ function getHierarchyNodeCopy(
               trace.provider,
               trace.model,
               formatCostSummaryLabel(
-                trace.costUsd ?? getHierarchyNodeCostUsd(node),
-                false,
+                getHierarchyNodeCostUsd(node) ?? trace.costUsd,
+                node.count > 1,
               ),
             ])
           : formatList([
@@ -3833,71 +3913,42 @@ function getHierarchyNodeCopy(
 }
 
 function getTraceDisplayCopy(
-  trace: Pick<
-    TraceSummary,
-    "hierarchy" | "kind" | "mode" | "model" | "provider"
-  >,
+  trace: Pick<TraceSummary, "kind" | "mode">,
 ): {
   breadcrumbs: Array<{ label: string; nodeId: string }>;
   path: string;
-  subtitle: string;
   title: string;
 } {
-  const actor = trace.hierarchy.childActorId || trace.hierarchy.rootActorId;
-  const breadcrumbs = getTraceBreadcrumbs(trace);
-  const pathParts = breadcrumbs.map((item) => item.label);
-
   return {
-    breadcrumbs,
-    path: pathParts.join(" / "),
-    subtitle: formatList([actor, trace.provider, trace.model]),
+    breadcrumbs: [],
+    path: "",
     title: getTraceTitle(trace),
   };
 }
 
-function getTraceBreadcrumbs(
-  trace: Pick<TraceSummary, "hierarchy" | "kind">,
-): Array<{ label: string; nodeId: string }> {
-  const sessionId = trace.hierarchy.sessionId || "unknown-session";
-  const rootActorId = trace.hierarchy.rootActorId || "unknown-actor";
-  const breadcrumbs = [
-    {
-      label: `Session ${shortId(sessionId)}`,
-      nodeId: `session:${sessionId}`,
-    },
-    {
-      label: rootActorId,
-      nodeId: `actor:${sessionId}:${rootActorId}`,
-    },
-  ];
+function getHierarchyPathDisplayCopy(
+  path: HierarchyNode[],
+  traceById: Map<string, TraceSummary>,
+): {
+  breadcrumbs: Array<{ label: string; nodeId: string }>;
+  path: string;
+  title: string;
+} {
+  const breadcrumbs = path.map((node) => ({
+    label: getHierarchyNodeCopy(node, traceById).label,
+    nodeId: node.id,
+  }));
+  const lastNode = path[path.length - 1] ?? null;
+  const lastTrace =
+    lastNode?.type === "trace" && lastNode.meta.traceId
+      ? (traceById.get(lastNode.meta.traceId) ?? null)
+      : null;
 
-  if (trace.kind === "guardrail") {
-    const label = `${capitalize(trace.hierarchy.guardrailPhase || "guardrail")} guardrail`;
-    breadcrumbs.push({
-      label,
-      nodeId: `guardrail:${sessionId}:${rootActorId}:${trace.hierarchy.guardrailType || label.toLowerCase()}`,
-    });
-  } else if (trace.kind === "child-actor" && trace.hierarchy.childActorId) {
-    breadcrumbs.push({
-      label: `Child actor: ${trace.hierarchy.childActorId}`,
-      nodeId: `child-actor:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId}`,
-    });
-  } else if (trace.kind === "stage") {
-    if (trace.hierarchy.childActorId) {
-      breadcrumbs.push({
-        label: `Child actor: ${trace.hierarchy.childActorId}`,
-        nodeId: `child-actor:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId}`,
-      });
-    }
-    if (trace.hierarchy.stage) {
-      breadcrumbs.push({
-        label: `Stage: ${trace.hierarchy.stage}`,
-        nodeId: `stage:${sessionId}:${rootActorId}:${trace.hierarchy.childActorId || "root"}:${trace.hierarchy.stage}`,
-      });
-    }
-  }
-
-  return breadcrumbs;
+  return {
+    breadcrumbs,
+    path: breadcrumbs.map((item) => item.label).join(" / "),
+    title: lastTrace ? getTraceTitle(lastTrace) : breadcrumbs.at(-1)?.label || "Trace",
+  };
 }
 
 function formatTraceProviderSummary(
@@ -4133,14 +4184,15 @@ function patchHierarchyNode(
 
   if (containsTrace) {
     if (node.type === "trace" && node.meta.traceId === traceId) {
-      nextMeta.costUsd = nextSummary.costUsd;
       nextMeta.model = nextSummary.model;
       nextMeta.provider = nextSummary.provider;
       nextMeta.status = nextSummary.status;
       nextLabel = nextSummary.model
         ? `${nextSummary.model} ${nextSummary.mode}`
         : traceId;
-    } else if (
+    }
+
+    if (
       costDelta !== 0 ||
       previousSummary?.costUsd !== null ||
       nextSummary.costUsd !== null

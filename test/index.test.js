@@ -55,67 +55,41 @@ function buildSessionTreeFixture() {
         {
           children: [
             {
-              children: [
-                {
-                  children: [],
-                  count: 1,
-                  id: 'trace:trace-stage',
-                  meta: { traceId: 'trace-stage' },
-                  traceIds: ['trace-stage'],
-                  type: 'trace',
-                },
-              ],
-              count: 1,
-              id: 'stage:s1-newer:assistant:review',
-              meta: { stage: 'review' },
-              traceIds: ['trace-stage'],
-              type: 'stage',
-            },
-            {
               children: [],
               count: 1,
-              id: 'trace:trace-root',
-              meta: { traceId: 'trace-root' },
-              traceIds: ['trace-root'],
+              id: 'trace:trace-stage',
+              meta: { traceId: 'trace-stage' },
+              traceIds: ['trace-stage'],
               type: 'trace',
             },
           ],
           count: 2,
-          id: 'actor:s1-newer:assistant',
-          meta: { actorId: 'assistant' },
+          id: 'trace:trace-root',
+          meta: { traceId: 'trace-root' },
           traceIds: ['trace-stage', 'trace-root'],
-          type: 'actor',
+          type: 'trace',
         },
       ],
       count: 2,
       id: 'session:s1-newer',
-      meta: { costUsd: 0.004, sessionId: 's1-newer' },
+      meta: { costUsd: 0.004, rootActorId: 'assistant', sessionId: 's1-newer' },
       traceIds: ['trace-stage', 'trace-root'],
       type: 'session',
     },
     {
       children: [
         {
-          children: [
-            {
-              children: [],
-              count: 1,
-              id: 'trace:trace-older',
-              meta: { traceId: 'trace-older' },
-              traceIds: ['trace-older'],
-              type: 'trace',
-            },
-          ],
+          children: [],
           count: 1,
-          id: 'actor:s2-older:reviewer',
-          meta: { actorId: 'reviewer' },
+          id: 'trace:trace-older',
+          meta: { traceId: 'trace-older' },
           traceIds: ['trace-older'],
-          type: 'actor',
+          type: 'trace',
         },
       ],
       count: 1,
       id: 'session:s2-older',
-      meta: { costUsd: 0.002, sessionId: 's2-older' },
+      meta: { costUsd: 0.002, rootActorId: 'reviewer', sessionId: 's2-older' },
       traceIds: ['trace-older'],
       type: 'session',
     },
@@ -257,7 +231,7 @@ test('nested wrapped model calls create child spans on the same trace', async ()
   assert.equal(inner.spanContext.traceId, outer.spanContext.traceId);
 });
 
-test('hierarchy nests sessions, actors, child actors, stages, and guardrails', async () => {
+test('hierarchy nests spans by OpenTelemetry parent span id within each session', async () => {
   const tracer = getLocalLLMTracer({ maxTraces: 10 });
   tracer.store.clear();
   const usage = { tokens: { prompt: 100, completion: 50 }, pricing: { prompt: 0.000001, completion: 0.000002 } };
@@ -269,9 +243,12 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
   );
   tracer.endSpan(root, { message: { role: 'assistant', content: 'root' }, tool_calls: [], usage });
 
+  const rootSpan = tracer.store.get(root);
+  assert.ok(rootSpan);
+
   const delegated = tracer.startSpan(
     { sessionId: 'session-1', rootSessionId: 'session-1', rootActorId: 'root-actor', actorId: 'child-actor', model: 'gpt-4.1' },
-    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
+    { mode: 'invoke', parentSpanId: rootSpan.spanContext.spanId, request: { input: { messages: [] }, options: {} } },
   );
   tracer.endSpan(delegated, { message: { role: 'assistant', content: 'delegated' }, tool_calls: [], usage });
 
@@ -284,7 +261,7 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
       stage: 'triage',
       model: 'gpt-4.1',
     },
-    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
+    { mode: 'invoke', parentSpanId: delegated, request: { input: { messages: [] }, options: {} } },
   );
   tracer.endSpan(workflow, { message: { role: 'assistant', content: 'workflow' }, tool_calls: [], usage });
 
@@ -297,7 +274,7 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
       guardrailType: 'outputPolicyCheck',
       model: 'gpt-4.1',
     },
-    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
+    { mode: 'invoke', parentSpanId: rootSpan.spanContext.spanId, request: { input: { messages: [] }, options: {} } },
   );
   tracer.endSpan(guardrail, { message: { role: 'assistant', content: 'guardrail' }, tool_calls: [], usage });
 
@@ -306,18 +283,26 @@ test('hierarchy nests sessions, actors, child actors, stages, and guardrails', a
   const session = tree.rootNodes[0];
   assert.equal(session.type, 'session');
   assert.equal(session.meta.costUsd, expectedCost * 4);
-  const actor = session.children.find((node) => node.type === 'actor');
-  assert.ok(actor);
-  assert.equal(actor.meta.costUsd, expectedCost * 4);
-  const childActorNode = actor.children.find((node) => node.type === 'child-actor');
-  assert.ok(childActorNode);
-  assert.equal(childActorNode.meta.costUsd, expectedCost);
-  const stageNode = actor.children.find((node) => node.type === 'stage');
-  assert.ok(stageNode);
-  assert.equal(stageNode.meta.costUsd, expectedCost);
-  const guardrailNode = actor.children.find((node) => node.type === 'guardrail');
+  assert.equal(session.children.length, 1);
+  const rootNode = session.children[0];
+  assert.equal(rootNode.type, 'trace');
+  assert.equal(rootNode.meta.traceId, root);
+  assert.equal(rootNode.meta.costUsd, expectedCost * 4);
+  assert.equal(rootNode.children.length, 2);
+
+  const delegatedNode = rootNode.children.find((node) => node.meta.traceId === delegated);
+  assert.ok(delegatedNode);
+  assert.equal(delegatedNode.meta.costUsd, expectedCost * 2);
+  assert.equal(delegatedNode.children.length, 1);
+  assert.equal(delegatedNode.children[0].meta.traceId, workflow);
+
+  const guardrailNode = rootNode.children.find((node) => node.meta.traceId === guardrail);
   assert.ok(guardrailNode);
   assert.equal(guardrailNode.meta.costUsd, expectedCost);
+  assert.deepEqual(
+    rootNode.children.map((node) => node.type),
+    ['trace', 'trace'],
+  );
 });
 
 test('legacy context aliases still normalize into the generic hierarchy model', async () => {
@@ -347,6 +332,32 @@ test('legacy context aliases still normalize into the generic hierarchy model', 
   assert.equal(trace.context.guardrailPhase, 'output');
   assert.equal(trace.hierarchy.sessionId, 'chat-legacy');
   assert.equal(trace.hierarchy.rootActorId, 'root-agent');
+});
+
+test('gen_ai.conversation.id overrides the session identifier used for hierarchy', async () => {
+  const tracer = getLocalLLMTracer({ maxTraces: 10 });
+  tracer.store.clear();
+
+  const traceId = tracer.startSpan(
+    { sessionId: 'context-session', rootActorId: 'assistant', actorId: 'assistant' },
+    {
+      attributes: { 'gen_ai.conversation.id': 'otel-session' },
+      mode: 'invoke',
+      request: { input: { messages: [] }, options: {} },
+    },
+  );
+  tracer.endSpan(traceId, { message: { role: 'assistant', content: 'done' }, tool_calls: [], usage: {} });
+
+  const trace = tracer.store.get(traceId);
+  assert.ok(trace);
+  assert.equal(trace.attributes['gen_ai.conversation.id'], 'otel-session');
+  assert.equal(trace.context.sessionId, 'otel-session');
+  assert.equal(trace.hierarchy.sessionId, 'otel-session');
+
+  const tree = tracer.store.hierarchy();
+  assert.equal(tree.rootNodes.length, 1);
+  assert.equal(tree.rootNodes[0].id, 'session:otel-session');
+  assert.equal(tree.rootNodes[0].meta.sessionId, 'otel-session');
 });
 
 test('derived insights surface structured input and guardrail context', async () => {
@@ -410,18 +421,21 @@ test('derived insights surface structured input and guardrail context', async ()
 test('session nav items sort by latest activity and aggregate status metadata', async () => {
   const sessionNodes = [
     {
-      children: [{ children: [], count: 2, id: 'actor:globalDefault', meta: { actorId: 'globalDefault' }, traceIds: ['trace-ok', 'trace-pending'], type: 'actor' }],
+      children: [
+        { children: [], count: 1, id: 'trace:trace-pending', meta: { traceId: 'trace-pending' }, traceIds: ['trace-pending'], type: 'trace' },
+        { children: [], count: 1, id: 'trace:trace-ok', meta: { traceId: 'trace-ok' }, traceIds: ['trace-ok'], type: 'trace' },
+      ],
       count: 2,
       id: 'session:b8cf8aa5-newest',
-      meta: { costUsd: 0.0072, sessionId: 'b8cf8aa5-newest' },
-      traceIds: ['trace-ok', 'trace-pending'],
+      meta: { costUsd: 0.0072, rootActorId: 'globalDefault', sessionId: 'b8cf8aa5-newest' },
+      traceIds: ['trace-pending', 'trace-ok'],
       type: 'session',
     },
     {
-      children: [{ children: [], count: 1, id: 'actor:reviewer', meta: { actorId: 'reviewer' }, traceIds: ['trace-error'], type: 'actor' }],
+      children: [{ children: [], count: 1, id: 'trace:trace-error', meta: { traceId: 'trace-error' }, traceIds: ['trace-error'], type: 'trace' }],
       count: 1,
       id: 'session:d1e2f3a4-error',
-      meta: { costUsd: 0.0025, sessionId: 'd1e2f3a4-error' },
+      meta: { costUsd: 0.0025, rootActorId: 'reviewer', sessionId: 'd1e2f3a4-error' },
       traceIds: ['trace-error'],
       type: 'session',
     },
@@ -501,12 +515,12 @@ test('session tree selection keeps the selected structure node and falls back to
 
   const selection = resolveSessionTreeSelection(
     sessionNodes,
-    'stage:s1-newer:assistant:review',
+    'session:s1-newer',
     'missing-trace',
   );
 
   assert.deepEqual(selection, {
-    selectedNodeId: 'stage:s1-newer:assistant:review',
+    selectedNodeId: 'session:s1-newer',
     selectedTraceId: 'trace-stage',
   });
 });
@@ -532,19 +546,19 @@ test('default session tree expansion opens only the active session and its selec
   const expanded = getDefaultExpandedSessionTreeNodeIds(
     sessionNodes,
     'session:s1-newer',
-    'stage:s1-newer:assistant:review',
+    'session:s1-newer',
+    'trace-stage',
   );
 
   assert.deepEqual(
     [...expanded].sort(),
     [
-      'actor:s1-newer:assistant',
       'session:s1-newer',
-      'stage:s1-newer:assistant:review',
+      'trace:trace-root',
     ].sort(),
   );
   assert.equal(expanded.has('session:s2-older'), false);
-  assert.equal(expanded.has('actor:s2-older:reviewer'), false);
+  assert.equal(expanded.has('trace:trace-older'), false);
 });
 
 test('SSE emits span lifecycle events', async () => {
