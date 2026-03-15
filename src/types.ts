@@ -1,5 +1,7 @@
 export type TraceMode = 'invoke' | 'stream';
 export type TraceStatus = 'pending' | 'ok' | 'error';
+export type SpanKind = 'INTERNAL' | 'SERVER' | 'CLIENT' | 'PRODUCER' | 'CONSUMER';
+export type SpanStatusCode = 'UNSET' | 'OK' | 'ERROR';
 
 export type TraceConfig = {
   host?: string;
@@ -9,6 +11,24 @@ export type TraceConfig = {
 };
 
 export type TraceTags = Record<string, string>;
+
+export type SpanAttributes = Record<string, any>;
+
+export type SpanContext = {
+  spanId: string;
+  traceId: string;
+};
+
+export type SpanEvent = {
+  attributes: SpanAttributes;
+  name: string;
+  timestamp: string;
+};
+
+export type SpanStatus = {
+  code: SpanStatusCode;
+  message?: string;
+};
 
 export type TraceContext = {
   actorId?: string | null;
@@ -86,6 +106,21 @@ export type TraceRequest = {
   options?: Record<string, any>;
 };
 
+export type SpanStartOptions = {
+  attributes?: SpanAttributes;
+  kind?: SpanKind;
+  mode?: TraceMode;
+  name?: string;
+  parentSpanId?: string | null;
+  request?: TraceRequest;
+};
+
+export type SpanEventInput = {
+  attributes?: SpanAttributes;
+  name: string;
+  payload?: unknown;
+};
+
 export type TraceStructuredInputInsight = {
   format: 'xml';
   role: string;
@@ -112,14 +147,18 @@ export type TraceSummaryFlags = {
 };
 
 export type TraceRecord = {
+  attributes: SpanAttributes;
   context: NormalizedTraceContext;
   endedAt: string | null;
   error: Record<string, any> | null;
+  events: SpanEvent[];
   hierarchy: TraceHierarchy;
   id: string;
   kind: string;
   mode: TraceMode;
   model: string | null;
+  name: string;
+  parentSpanId: string | null;
   provider: string | null;
   request: {
     input?: Record<string, any>;
@@ -127,6 +166,9 @@ export type TraceRecord = {
   };
   response: Record<string, any> | null;
   startedAt: string;
+  spanContext: SpanContext;
+  spanKind: SpanKind;
+  spanStatus: SpanStatus;
   status: TraceStatus;
   stream: null | {
     chunkCount: number;
@@ -166,6 +208,8 @@ export type TraceSummary = {
 };
 
 export type TraceEvent = {
+  span?: TraceRecord;
+  spanId: string | null;
   timestamp: string;
   trace?: TraceRecord;
   traceId: string | null;
@@ -264,14 +308,18 @@ export type UIWatchController = {
 };
 
 export type LocalLLMTracer = {
+  addSpanEvent(spanId: string, event: SpanEventInput): void;
   configure(config?: TraceConfig): void;
+  endSpan(spanId: string, response?: unknown): void;
   isEnabled(): boolean;
+  recordException(spanId: string, error: unknown): void;
   recordError(traceId: string, error: unknown): void;
   recordInvokeFinish(traceId: string, response: unknown): void;
   recordInvokeStart(context: TraceContext, request: TraceRequest): string;
   recordStreamChunk(traceId: string, chunk: unknown): void;
   recordStreamFinish(traceId: string, chunk: unknown): void;
   recordStreamStart(context: TraceContext, request: TraceRequest): string;
+  startSpan(context: TraceContext, options?: SpanStartOptions): string;
   startServer(): Promise<{ host: string; port: number; url: string } | null>;
   store: any;
 }

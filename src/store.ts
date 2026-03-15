@@ -1,8 +1,13 @@
+import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import {
   type HierarchyNode,
   type HierarchyResponse,
   type NormalizedTraceContext,
+  type SpanAttributes,
+  type SpanEvent,
+  type SpanEventInput,
+  type SpanStartOptions,
   type TraceEvent,
   type TraceFilters,
   type TraceListResponse,
@@ -29,85 +34,137 @@ export class TraceStore extends EventEmitter {
   }
 
   recordInvokeStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
-    return this.recordStart('invoke', context, request);
+    return this.startSpan(context, {
+      mode: 'invoke',
+      name: 'llm.invoke',
+      request,
+    });
   }
 
   recordInvokeFinish(traceId: string, response: any) {
-    const trace = this.traces.get(traceId);
+    this.endSpan(traceId, response);
+  }
+
+  recordStreamStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
+    return this.startSpan(context, {
+      mode: 'stream',
+      name: 'llm.stream',
+      request,
+    });
+  }
+
+  recordStreamChunk(traceId: string, chunk: any) {
+    this.addSpanEvent(traceId, toSpanEventInput(chunk));
+  }
+
+  recordStreamFinish(traceId: string, chunk: any) {
+    this.endSpan(traceId, chunk);
+  }
+
+  recordError(traceId: string, error: unknown) {
+    this.recordException(traceId, error);
+  }
+
+  startSpan(context: NormalizedTraceContext | undefined, options: SpanStartOptions = {}): string {
+    return this.recordStart(options.mode || 'invoke', context, options.request || {}, options);
+  }
+
+  addSpanEvent(spanId: string, event: SpanEventInput) {
+    const trace = this.traces.get(spanId);
     if (!trace) {
       return;
     }
 
-    trace.response = safeClone(response);
-    trace.usage = safeClone(response?.usage);
-    trace.status = 'ok';
-    trace.endedAt = new Date().toISOString();
-    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
+    const spanEvent = normalizeSpanEvent(event);
+    trace.events.push(spanEvent);
+    this.applyStreamPayload(trace, event.payload, spanEvent);
+    this.publish('span:update', spanId, { trace: this.cloneTrace(trace) });
   }
 
-  recordStreamStart(context: NormalizedTraceContext | undefined, request: TraceRequest): string {
-    return this.recordStart('stream', context, request);
-  }
-
-  recordStreamChunk(traceId: string, chunk: any) {
-    const trace = this.traces.get(traceId);
-    if (!trace || !trace.stream) {
+  endSpan(spanId: string, response: any) {
+    const trace = this.traces.get(spanId);
+    if (!trace) {
       return;
     }
 
-    const clone = safeClone(chunk);
+    const clone = safeClone(response);
+    if (trace.mode === 'stream') {
+      const finishEvent = normalizeSpanEvent(toSpanEventInput(clone));
+      trace.events.push(finishEvent);
+      this.applyStreamPayload(trace, clone, finishEvent);
+      trace.response = clone;
+      trace.usage = safeClone(clone?.usage);
+    } else {
+      trace.response = clone;
+      trace.usage = safeClone(clone?.usage);
+    }
+
+    trace.status = 'ok';
+    trace.spanStatus = { code: 'OK' };
+    trace.endedAt = new Date().toISOString();
+    this.publish('span:end', spanId, { trace: this.cloneTrace(trace) });
+  }
+
+  recordException(spanId: string, error: unknown) {
+    const trace = this.traces.get(spanId);
+    if (!trace) {
+      return;
+    }
+
+    const payload = toErrorPayload(error);
+    trace.error = payload;
+    trace.events.push({
+      attributes: payload || {},
+      name: 'exception',
+      timestamp: new Date().toISOString(),
+    });
+    trace.status = 'error';
+    trace.spanStatus = {
+      code: 'ERROR',
+      message: payload?.message,
+    };
+    trace.endedAt = new Date().toISOString();
+    this.publish('span:end', spanId, { trace: this.cloneTrace(trace) });
+  }
+
+  private applyStreamPayload(trace: TraceRecord, payload: unknown, spanEvent: SpanEvent) {
+    if (!trace.stream) {
+      return;
+    }
+
+    const clone = toStreamPayload(payload, spanEvent);
     if (clone && typeof clone === 'object') {
       clone.offsetMs = Math.max(0, Date.now() - Date.parse(trace.startedAt));
     }
     trace.stream.events.push(clone);
 
-    if (chunk?.type === 'chunk') {
+    if (clone?.type === 'chunk') {
       trace.stream.chunkCount += 1;
       if (trace.stream.firstChunkMs === null) {
         trace.stream.firstChunkMs = Date.now() - Date.parse(trace.startedAt);
       }
 
-      if (typeof chunk.content === 'string') {
-        trace.stream.reconstructed.message.content = `${trace.stream.reconstructed.message.content || ''}${chunk.content}`;
+      if (typeof clone.content === 'string') {
+        trace.stream.reconstructed.message.content = `${trace.stream.reconstructed.message.content || ''}${clone.content}`;
       }
     }
 
-    if (chunk?.type === 'begin') {
-      trace.stream.reconstructed.message.role = chunk.role;
+    if (clone?.type === 'begin') {
+      trace.stream.reconstructed.message.role = clone.role;
     }
 
-    if (chunk?.type === 'finish') {
+    if (clone?.type === 'finish') {
       trace.response = clone;
-      trace.usage = safeClone(chunk.usage);
+      trace.usage = safeClone(clone.usage);
       trace.stream.reconstructed.message = {
-        ...(safeClone(chunk.message) || {}),
+        ...(safeClone(clone.message) || {}),
         content:
           trace.stream.reconstructed.message.content ||
-          (typeof chunk.message?.content === 'string' ? chunk.message.content : chunk.message?.content ?? null),
+          (typeof clone.message?.content === 'string' ? clone.message.content : clone.message?.content ?? null),
       };
-      trace.stream.reconstructed.tool_calls = safeClone(chunk.tool_calls || []);
-      trace.stream.reconstructed.usage = safeClone(chunk.usage || null);
-      trace.status = 'ok';
-      trace.endedAt = new Date().toISOString();
+      trace.stream.reconstructed.tool_calls = safeClone(clone.tool_calls || []);
+      trace.stream.reconstructed.usage = safeClone(clone.usage || null);
     }
-
-    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
-  }
-
-  recordStreamFinish(traceId: string, chunk: any) {
-    this.recordStreamChunk(traceId, chunk);
-  }
-
-  recordError(traceId: string, error: unknown) {
-    const trace = this.traces.get(traceId);
-    if (!trace) {
-      return;
-    }
-
-    trace.error = toErrorPayload(error);
-    trace.status = 'error';
-    trace.endedAt = new Date().toISOString();
-    this.publish('trace:update', traceId, { trace: this.cloneTrace(trace) });
   }
 
   list(filters: TraceFilters = {}): TraceListResponse {
@@ -133,7 +190,7 @@ export class TraceStore extends EventEmitter {
   clear() {
     this.order = [];
     this.traces.clear();
-    this.publish('trace:clear', null, {});
+    this.publish('span:clear', null, {});
   }
 
   hierarchy(filters: TraceFilters = {}): HierarchyResponse {
@@ -226,19 +283,28 @@ export class TraceStore extends EventEmitter {
     };
   }
 
-  private recordStart(mode: TraceRecord['mode'], context: NormalizedTraceContext | undefined, request: TraceRequest): string {
+  private recordStart(
+    mode: TraceRecord['mode'],
+    context: NormalizedTraceContext | undefined,
+    request: TraceRequest,
+    options: Pick<SpanStartOptions, 'attributes' | 'kind' | 'name' | 'parentSpanId'> = {},
+  ): string {
     const traceContext = normalizeTraceContext(context as any, mode);
     const traceId = randomId();
     const startedAt = new Date().toISOString();
     const trace: TraceRecord = {
+      attributes: buildSpanAttributes(traceContext, mode, options.attributes),
       context: traceContext,
       endedAt: null,
       error: null,
+      events: [],
       hierarchy: traceContext.hierarchy,
       id: traceId,
       kind: traceContext.kind,
       mode,
       model: traceContext.model,
+      name: options.name || getDefaultSpanName(traceContext, mode),
+      parentSpanId: options.parentSpanId || null,
       provider: traceContext.provider,
       request: {
         input: safeClone(request?.input),
@@ -249,6 +315,12 @@ export class TraceStore extends EventEmitter {
       },
       response: null,
       startedAt,
+      spanContext: {
+        spanId: randomHexId(16),
+        traceId: randomHexId(32),
+      },
+      spanKind: options.kind || 'CLIENT',
+      spanStatus: { code: 'UNSET' },
       status: 'pending',
       stream:
         mode === 'stream'
@@ -270,7 +342,7 @@ export class TraceStore extends EventEmitter {
     this.order.push(traceId);
     this.traces.set(traceId, trace);
     this.evictIfNeeded();
-    this.publish('trace:add', traceId, { trace: this.cloneTrace(trace) });
+    this.publish('span:start', traceId, { trace: this.cloneTrace(trace) });
 
     return traceId;
   }
@@ -282,7 +354,7 @@ export class TraceStore extends EventEmitter {
       if (oldest) {
         this.traces.delete(oldest);
       }
-      this.publish('trace:evict', oldest || null, removed ? { trace: this.cloneTrace(removed) } : {});
+      this.publish('span:evict', oldest || null, removed ? { trace: this.cloneTrace(removed) } : {});
     }
   }
 
@@ -351,6 +423,8 @@ export class TraceStore extends EventEmitter {
 
   private publish(type: string, traceId: string | null, payload: { trace?: TraceRecord }) {
     const event: TraceEvent = {
+      span: payload.trace,
+      spanId: traceId,
       type,
       traceId,
       timestamp: new Date().toISOString(),
@@ -476,4 +550,82 @@ function buildGroupHierarchy(traces: TraceRecord[], groupBy: string): HierarchyN
 
 function randomId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function randomHexId(length: number): string {
+  return randomBytes(Math.ceil(length / 2)).toString('hex').slice(0, length);
+}
+
+function normalizeSpanEvent(event: SpanEventInput): SpanEvent {
+  return {
+    attributes: safeClone(event.attributes || {}),
+    name: event.name,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function toSpanEventInput(chunk: any): SpanEventInput {
+  const payload = safeClone(chunk);
+  const type = typeof payload?.type === 'string' && payload.type ? payload.type : 'event';
+  const attributes = payload && typeof payload === 'object' ? { ...payload } : {};
+
+  if ('type' in attributes) {
+    delete attributes.type;
+  }
+
+  return {
+    attributes,
+    name: `stream.${type}`,
+    payload,
+  };
+}
+
+function toStreamPayload(payload: unknown, spanEvent: SpanEvent): Record<string, any> {
+  if (payload && typeof payload === 'object') {
+    return safeClone(payload as Record<string, any>);
+  }
+
+  const suffix = spanEvent.name.startsWith('stream.') ? spanEvent.name.slice('stream.'.length) : spanEvent.name;
+  return {
+    ...safeClone(spanEvent.attributes || {}),
+    type: suffix || 'event',
+  };
+}
+
+function getDefaultSpanName(context: NormalizedTraceContext, mode: TraceRecord['mode']): string {
+  const prefix = context.provider || 'llm';
+  return `${prefix}.${mode}`;
+}
+
+function buildSpanAttributes(
+  context: NormalizedTraceContext,
+  mode: TraceRecord['mode'],
+  extraAttributes: SpanAttributes | undefined,
+): SpanAttributes {
+  const base: SpanAttributes = {
+    'gen_ai.request.model': context.model || undefined,
+    'gen_ai.system': context.provider || undefined,
+    'llm.operation.mode': mode,
+    'loupe.actor.id': context.actorId || undefined,
+    'loupe.actor.type': context.actorType || undefined,
+    'loupe.guardrail.phase': context.guardrailPhase || undefined,
+    'loupe.guardrail.type': context.guardrailType || undefined,
+    'loupe.root_actor.id': context.rootActorId || undefined,
+    'loupe.root_session.id': context.rootSessionId || undefined,
+    'loupe.session.id': context.sessionId || undefined,
+    'loupe.stage': context.stage || undefined,
+    'loupe.tenant.id': context.tenantId || undefined,
+    'loupe.user.id': context.userId || undefined,
+  };
+
+  for (const [key, value] of Object.entries(context.tags || {})) {
+    base[`loupe.tag.${key}`] = value;
+  }
+
+  return Object.fromEntries(
+    Object.entries({
+      ...base,
+      ...(extraAttributes || {}),
+    }).filter(([, value]) => value !== undefined && value !== null),
+  );
 }

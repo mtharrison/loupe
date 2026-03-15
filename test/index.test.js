@@ -6,13 +6,17 @@ const http = require('node:http');
 
 const {
   __resetLocalLLMTracerForTests,
+  addSpanEvent,
+  endSpan,
   getLocalLLMTracer,
+  recordException,
   recordError,
   recordInvokeFinish,
   recordInvokeStart,
   recordStreamChunk,
   recordStreamFinish,
   recordStreamStart,
+  startSpan,
   startTraceServer,
   wrapChatModel,
   wrapOpenAIClient,
@@ -131,7 +135,7 @@ afterEach(() => {
   delete process.env.LLM_TRACE_UI_HOT_RELOAD;
 });
 
-test('low-level lifecycle exports record traces through the singleton tracer', async () => {
+test('OpenTelemetry-style span lifecycle exports record traces through the singleton tracer', async () => {
   process.env.LLM_TRACE_ENABLED = '1';
   const port = reservePort();
   const tracer = getLocalLLMTracer({ maxTraces: 10, port });
@@ -139,40 +143,49 @@ test('low-level lifecycle exports record traces through the singleton tracer', a
 
   await startTraceServer({ port });
 
-  const invokeTraceId = recordInvokeStart(
-    { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
-    { input: { messages: [{ role: 'user', content: 'hello' }] }, options: {} },
-  );
-  recordInvokeFinish(invokeTraceId, {
-    message: { role: 'assistant', content: 'world' },
-    tool_calls: [],
-    usage: { tokens: { prompt: 1, completion: 2 }, pricing: { prompt: 0.1, completion: 0.2 } },
-  });
+   const invokeTraceId = startSpan(
+     { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
+     { mode: 'invoke', name: 'openai.chat.completions', request: { input: { messages: [{ role: 'user', content: 'hello' }] }, options: {} } },
+   );
+   endSpan(invokeTraceId, {
+     message: { role: 'assistant', content: 'world' },
+     tool_calls: [],
+     usage: { tokens: { prompt: 1, completion: 2 }, pricing: { prompt: 0.1, completion: 0.2 } },
+   });
 
-  const streamTraceId = recordStreamStart(
-    { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
-    { input: { messages: [{ role: 'user', content: 'stream' }] }, options: {} },
-  );
-  recordStreamChunk(streamTraceId, { type: 'begin', role: 'assistant' });
-  recordStreamChunk(streamTraceId, { type: 'chunk', content: 'abc' });
-  recordStreamFinish(streamTraceId, {
-    type: 'finish',
-    message: { role: 'assistant', content: 'abc' },
-    tool_calls: [],
-    usage: { tokens: { prompt: 2, completion: 3 }, pricing: { prompt: 0.01, completion: 0.02 } },
-  });
+   const streamTraceId = startSpan(
+     { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
+     { mode: 'stream', name: 'openai.chat.completions', request: { input: { messages: [{ role: 'user', content: 'stream' }] }, options: {} } },
+   );
+   addSpanEvent(streamTraceId, { name: 'stream.begin', attributes: { role: 'assistant' } });
+   addSpanEvent(streamTraceId, { name: 'stream.chunk', attributes: { content: 'abc' } });
+   endSpan(streamTraceId, {
+     type: 'finish',
+     message: { role: 'assistant', content: 'abc' },
+     tool_calls: [],
+     usage: { tokens: { prompt: 2, completion: 3 }, pricing: { prompt: 0.01, completion: 0.02 } },
+   });
 
-  const errorTraceId = recordInvokeStart(
-    { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root' },
-    { input: { messages: [] }, options: {} },
-  );
-  recordError(errorTraceId, new Error('boom'));
+   const errorTraceId = startSpan(
+     { sessionId: 'session-low-level', rootActorId: 'root', actorId: 'root' },
+     { mode: 'invoke', name: 'llm.invoke', request: { input: { messages: [] }, options: {} } },
+   );
+   recordException(errorTraceId, new Error('boom'));
 
-  const traces = tracer.store.list().items;
-  assert.equal(traces.length, 3);
-  assert.equal(traces[0].status, 'error');
-  assert.equal(traces[1].mode, 'stream');
-  assert.equal(traces[2].mode, 'invoke');
+   const traces = tracer.store.list().items;
+   assert.equal(traces.length, 3);
+   assert.equal(traces[0].status, 'error');
+   assert.equal(traces[1].mode, 'stream');
+   assert.equal(traces[2].mode, 'invoke');
+
+   const span = tracer.store.get(traces[1].id);
+   assert.equal(span.name, 'openai.chat.completions');
+   assert.equal(span.spanKind, 'CLIENT');
+   assert.equal(span.spanStatus.code, 'OK');
+   assert.equal(span.events[0].name, 'stream.begin');
+   assert.equal(span.events[1].attributes.content, 'abc');
+   assert.match(span.spanContext.traceId, /^[0-9a-f]{32}$/);
+   assert.match(span.spanContext.spanId, /^[0-9a-f]{16}$/);
 });
 
 test('ring buffer evicts the oldest traces', async () => {
@@ -496,7 +509,7 @@ test('SSE emits trace lifecycle events', async () => {
       res.setEncoding('utf8');
       res.on('data', (chunk) => {
         chunks.push(chunk);
-        if (chunks.join('').includes('"type":"trace:update"')) {
+        if (chunks.join('').includes('"type":"span:end"')) {
           res.destroy();
           resolve();
         }
@@ -512,8 +525,9 @@ test('SSE emits trace lifecycle events', async () => {
     req.end();
   });
 
-  assert.ok(chunks.join('').includes('"type":"trace:add"'));
-  assert.ok(chunks.join('').includes('"type":"trace:update"'));
+  assert.ok(chunks.join('').includes('"type":"span:start"'));
+  assert.ok(chunks.join('').includes('"type":"span:end"'));
+  assert.ok(chunks.join('').includes('"spanId"'));
   assert.ok(chunks.join('').includes('"insights"'));
 });
 

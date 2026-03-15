@@ -127,7 +127,7 @@ The script tries to open the dashboard automatically and prints the local URL ei
 
 ## Low-Level Lifecycle API
 
-If you need full control over trace boundaries, Loupe also exposes the lower-level `record*` lifecycle functions.
+If you need full control over trace boundaries, Loupe also exposes a lower-level span lifecycle API modeled on OpenTelemetry concepts: start a span, add events, end it, and record exceptions.
 
 Start the dashboard during app startup, then instrument a model call:
 
@@ -135,9 +135,9 @@ Start the dashboard during app startup, then instrument a model call:
 import {
   getLocalLLMTracer,
   isTraceEnabled,
-  recordError,
-  recordInvokeFinish,
-  recordInvokeStart,
+  endSpan,
+  recordException,
+  startSpan,
   type TraceContext,
 } from '@mtharrison/loupe';
 
@@ -166,51 +166,65 @@ const request = {
   options: {},
 };
 
-const traceId = recordInvokeStart(context, request);
+const spanId = startSpan(context, {
+  mode: 'invoke',
+  name: 'openai.chat.completions',
+  request,
+});
 
 try {
   const response = await model.invoke(request.input, request.options);
-  recordInvokeFinish(traceId, response);
+  endSpan(spanId, response);
   return response;
 } catch (error) {
-  recordError(traceId, error);
+  recordException(spanId, error);
   throw error;
 }
 ```
 
 ### Streaming
 
-Streaming works the same way. Loupe records each chunk event, first-chunk latency, and the reconstructed final response.
+Streaming works the same way. Loupe records each span event, first-chunk latency, and the reconstructed final response.
 
 ```ts
 import {
-  recordError,
-  recordStreamChunk,
-  recordStreamFinish,
-  recordStreamStart,
+  addSpanEvent,
+  endSpan,
+  recordException,
+  startSpan,
 } from '@mtharrison/loupe';
 
-const traceId = recordStreamStart(context, request);
+const spanId = startSpan(context, {
+  mode: 'stream',
+  name: 'openai.chat.completions',
+  request,
+});
 
 try {
   for await (const chunk of model.stream(request.input, request.options)) {
     if (chunk?.type === 'finish') {
-      recordStreamFinish(traceId, chunk);
+      endSpan(spanId, chunk);
     } else {
-      recordStreamChunk(traceId, chunk);
+      addSpanEvent(spanId, {
+        name: `stream.${chunk?.type || 'event'}`,
+        attributes: chunk,
+        payload: chunk,
+      });
     }
 
     yield chunk;
   }
 } catch (error) {
-  recordError(traceId, error);
+  recordException(spanId, error);
   throw error;
 }
 ```
 
+The older `recordInvokeStart()`, `recordInvokeFinish()`, `recordStreamStart()`, `recordStreamChunk()`, `recordStreamFinish()`, and `recordError()` helpers remain available as compatibility wrappers over the span lifecycle API.
+
 ## Trace Context
 
-Loupe gets its hierarchy and filters from the context you pass to `recordInvokeStart()` and `recordStreamStart()`.
+Loupe gets its hierarchy and filters from the context you pass to `startSpan()` and the compatibility `record*` helpers.
 
 ### Generic context fields
 
@@ -322,7 +336,7 @@ Programmatic configuration is also available through `getLocalLLMTracer(config)`
 
 ## API
 
-Loupe exposes both low-level lifecycle functions and lightweight wrappers.
+Loupe exposes both low-level span lifecycle functions and lightweight wrappers.
 
 ### `isTraceEnabled()`
 
@@ -340,29 +354,25 @@ Returns the singleton tracer instance. This is useful if you want to:
 
 Starts the local dashboard server eagerly instead of waiting for the first trace.
 
-### `recordInvokeStart(context, request, config?)`
+### `startSpan(context, options?, config?)`
 
-Creates an `invoke` trace and returns a `traceId`.
+Creates a span and returns its Loupe `spanId`. Pass `mode`, `name`, and `request` in `options` to describe the operation.
 
-### `recordInvokeFinish(traceId, response, config?)`
+### `addSpanEvent(spanId, event, config?)`
 
-Marks an `invoke` trace as complete and stores the response payload.
+Appends an event to an existing span. For streaming traces, pass the raw chunk as `event.payload` to preserve chunk reconstruction in the UI.
 
-### `recordStreamStart(context, request, config?)`
+### `endSpan(spanId, response, config?)`
 
-Creates a `stream` trace and returns a `traceId`.
+Marks a span as complete and stores the final response payload.
 
-### `recordStreamChunk(traceId, chunk, config?)`
+### `recordException(spanId, error, config?)`
 
-Appends a non-final stream chunk to an existing trace.
+Marks a span as failed and stores a serialized exception payload.
 
-### `recordStreamFinish(traceId, chunk, config?)`
+### Compatibility `record*` helpers
 
-Stores the final stream payload and marks the trace complete.
-
-### `recordError(traceId, error, config?)`
-
-Marks a trace as failed and stores a serialized error payload.
+Loupe still exports `recordInvokeStart()`, `recordInvokeFinish()`, `recordStreamStart()`, `recordStreamChunk()`, `recordStreamFinish()`, and `recordError()` for existing integrations. They forward to the span lifecycle API above.
 
 All of these functions forward to the singleton tracer returned by `getLocalLLMTracer()`.
 

@@ -8,6 +8,8 @@ import {
   type OpenAIChatCompletionCreateParamsLike,
   type OpenAIChatCompletionStreamLike,
   type OpenAIClientLike,
+  type SpanEventInput,
+  type SpanStartOptions,
   type TraceConfig,
   type TraceContext,
   type TraceRequest,
@@ -24,6 +26,14 @@ export type {
   OpenAIChatCompletionCreateParamsLike,
   OpenAIChatCompletionStreamLike,
   OpenAIClientLike,
+  SpanAttributes,
+  SpanContext,
+  SpanEvent,
+  SpanEventInput,
+  SpanKind,
+  SpanStartOptions,
+  SpanStatus,
+  SpanStatusCode,
   TraceConfig,
   TraceContext,
   TraceEvent,
@@ -65,8 +75,16 @@ export function recordInvokeStart(context: TraceContext, request: TraceRequest, 
   return getLocalLLMTracer(config).recordInvokeStart(context, request);
 }
 
+export function startSpan(context: TraceContext, options: SpanStartOptions = {}, config: TraceConfig = {}): string {
+  return getLocalLLMTracer(config).startSpan(context, options);
+}
+
 export function recordInvokeFinish(traceId: string, response: unknown, config: TraceConfig = {}) {
   getLocalLLMTracer(config).recordInvokeFinish(traceId, response);
+}
+
+export function endSpan(spanId: string, response: unknown, config: TraceConfig = {}) {
+  getLocalLLMTracer(config).endSpan(spanId, response);
 }
 
 export function recordStreamStart(context: TraceContext, request: TraceRequest, config: TraceConfig = {}): string {
@@ -77,12 +95,20 @@ export function recordStreamChunk(traceId: string, chunk: unknown, config: Trace
   getLocalLLMTracer(config).recordStreamChunk(traceId, chunk);
 }
 
+export function addSpanEvent(spanId: string, event: SpanEventInput, config: TraceConfig = {}) {
+  getLocalLLMTracer(config).addSpanEvent(spanId, event);
+}
+
 export function recordStreamFinish(traceId: string, chunk: unknown, config: TraceConfig = {}) {
   getLocalLLMTracer(config).recordStreamFinish(traceId, chunk);
 }
 
 export function recordError(traceId: string, error: unknown, config: TraceConfig = {}) {
   getLocalLLMTracer(config).recordError(traceId, error);
+}
+
+export function recordException(spanId: string, error: unknown, config: TraceConfig = {}) {
+  getLocalLLMTracer(config).recordException(spanId, error);
 }
 
 export function __resetLocalLLMTracerForTests() {
@@ -115,13 +141,17 @@ export function wrapChatModel<
         return model.invoke(input, options);
       }
 
-      const traceId = tracer.recordInvokeStart(getContext ? getContext() : {}, { input: input as any, options: options as any });
+      const traceId = tracer.startSpan(getContext ? getContext() : {}, {
+        mode: 'invoke',
+        name: 'llm.invoke',
+        request: { input: input as any, options: options as any },
+      });
       try {
         const response = await model.invoke(input, options);
-        tracer.recordInvokeFinish(traceId, response);
+        tracer.endSpan(traceId, response);
         return response;
       } catch (error) {
-        tracer.recordError(traceId, error);
+        tracer.recordException(traceId, error);
         throw error;
       }
     },
@@ -133,20 +163,24 @@ export function wrapChatModel<
         return;
       }
 
-      const traceId = tracer.recordStreamStart(getContext ? getContext() : {}, { input: input as any, options: options as any });
+      const traceId = tracer.startSpan(getContext ? getContext() : {}, {
+        mode: 'stream',
+        name: 'llm.stream',
+        request: { input: input as any, options: options as any },
+      });
 
       try {
         const stream = model.stream(input, options);
         for await (const chunk of stream) {
           if ((chunk as any)?.type === 'finish') {
-            tracer.recordStreamFinish(traceId, chunk);
+            tracer.endSpan(traceId, chunk);
           } else {
-            tracer.recordStreamChunk(traceId, chunk);
+            tracer.addSpanEvent(traceId, toSpanEventInputFromChunk(chunk));
           }
           yield chunk;
         }
       } catch (error) {
-        tracer.recordError(traceId, error);
+        tracer.recordException(traceId, error);
         throw error;
       }
     },
@@ -176,25 +210,33 @@ export function wrapOpenAIClient<
           const context = withOpenAITraceContext(getContext ? getContext() : {}, params);
 
           if (params?.stream) {
-            const traceId = tracer.recordStreamStart(context, { input: params as any, options: options as any });
+            const traceId = tracer.startSpan(context, {
+              mode: 'stream',
+              name: 'openai.chat.completions',
+              request: { input: params as any, options: options as any },
+            });
 
             try {
               const stream = await target.create.call(target, params, options);
               return wrapOpenAIChatCompletionsStream(stream, tracer, traceId);
             } catch (error) {
-              tracer.recordError(traceId, error);
+              tracer.recordException(traceId, error);
               throw error;
             }
           }
 
-          const traceId = tracer.recordInvokeStart(context, { input: params as any, options: options as any });
+          const traceId = tracer.startSpan(context, {
+            mode: 'invoke',
+            name: 'openai.chat.completions',
+            request: { input: params as any, options: options as any },
+          });
 
           try {
             const response = await target.create.call(target, params, options);
-            tracer.recordInvokeFinish(traceId, normalizeOpenAIChatCompletionResponse(response));
+            tracer.endSpan(traceId, normalizeOpenAIChatCompletionResponse(response));
             return response;
           } catch (error) {
-            tracer.recordError(traceId, error);
+            tracer.recordException(traceId, error);
             throw error;
           }
         };
@@ -283,6 +325,26 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     return isTraceEnabled();
   }
 
+  startSpan(context: TraceContext, options: SpanStartOptions = {}): string {
+    void this.startServer();
+    return this.store.startSpan(context as any, {
+      ...options,
+      request: normaliseRequest(options.request || {}),
+    });
+  }
+
+  addSpanEvent(spanId: string, event: SpanEventInput) {
+    this.store.addSpanEvent(spanId, safeClone(event));
+  }
+
+  endSpan(spanId: string, response?: unknown) {
+    this.store.endSpan(spanId, safeClone(response));
+  }
+
+  recordException(spanId: string, error: unknown) {
+    this.store.recordException(spanId, error);
+  }
+
   startServer(): Promise<{ host: string; port: number; url: string } | null> {
     if (!this.isEnabled() || this.serverFailed) {
       return Promise.resolve(this.serverInfo);
@@ -330,29 +392,35 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
   }
 
   recordInvokeStart(context: TraceContext, request: { input?: Record<string, any>; options?: Record<string, any> }): string {
-    void this.startServer();
-    return this.store.recordInvokeStart(context as any, normaliseRequest(request));
+    return this.startSpan(context, {
+      mode: 'invoke',
+      name: 'llm.invoke',
+      request,
+    });
   }
 
   recordInvokeFinish(traceId: string, response: unknown) {
-    this.store.recordInvokeFinish(traceId, safeClone(response));
+    this.endSpan(traceId, response);
   }
 
   recordStreamStart(context: TraceContext, request: { input?: Record<string, any>; options?: Record<string, any> }): string {
-    void this.startServer();
-    return this.store.recordStreamStart(context as any, normaliseRequest(request));
+    return this.startSpan(context, {
+      mode: 'stream',
+      name: 'llm.stream',
+      request,
+    });
   }
 
   recordStreamChunk(traceId: string, chunk: unknown) {
-    this.store.recordStreamChunk(traceId, safeClone(chunk));
+    this.addSpanEvent(traceId, toSpanEventInputFromChunk(chunk));
   }
 
   recordStreamFinish(traceId: string, chunk: unknown) {
-    this.store.recordStreamFinish(traceId, safeClone(chunk));
+    this.endSpan(traceId, chunk);
   }
 
   recordError(traceId: string, error: unknown) {
-    this.store.recordError(traceId, error);
+    this.recordException(traceId, error);
   }
 }
 
@@ -365,6 +433,22 @@ function normaliseRequest(request: { input?: Record<string, any>; options?: Reco
 
 function bindMethod<TTarget extends object>(target: TTarget, value: unknown) {
   return typeof value === 'function' ? value.bind(target) : value;
+}
+
+function toSpanEventInputFromChunk(chunk: unknown): SpanEventInput {
+  const payload = safeClone(chunk) as Record<string, any> | null;
+  const type = typeof payload?.type === 'string' && payload.type ? payload.type : 'event';
+  const attributes = payload && typeof payload === 'object' ? { ...payload } : {};
+
+  if ('type' in attributes) {
+    delete attributes.type;
+  }
+
+  return {
+    attributes,
+    name: `stream.${type}`,
+    payload,
+  };
 }
 
 function getConfiguredPort(
