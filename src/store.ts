@@ -35,7 +35,7 @@ export class TraceStore extends EventEmitter {
     this.traces = new Map();
   }
 
-  startSpan(context: NormalizedTraceContext | undefined, options: SpanStartOptions = {}): string {
+  startSpan(context: NormalizedTraceContext | undefined, options: SpanStartOptions & { spanContext?: TraceRecord['spanContext'] } = {}): string {
     return this.recordStart(options.mode || 'invoke', context, options.request || {}, options);
   }
 
@@ -264,7 +264,7 @@ export class TraceStore extends EventEmitter {
     mode: TraceRecord['mode'],
     context: NormalizedTraceContext | undefined,
     request: TraceRequest,
-    options: Pick<SpanStartOptions, 'attributes' | 'kind' | 'name' | 'parentSpanId'> = {},
+    options: Pick<SpanStartOptions, 'attributes' | 'kind' | 'name' | 'parentSpanId'> & { spanContext?: TraceRecord['spanContext'] } = {},
   ): string {
     const traceContext = normalizeTraceContext(context as any, mode);
     const traceId = randomId();
@@ -293,13 +293,14 @@ export class TraceStore extends EventEmitter {
       },
       response: null,
       startedAt,
-      spanContext: {
-        // The returned Loupe span handle (trace.id) is used for local mutation and SSE updates.
-        // spanContext contains the OpenTelemetry trace/span identifiers that are attached to
-        // the exported span payload and inherited by child spans.
-        spanId: randomHexId(16),
-        traceId: parentSpan?.spanContext.traceId || randomHexId(32),
-      },
+      spanContext:
+        options.spanContext || {
+          // The returned Loupe span handle (trace.id) is used for local mutation and SSE updates.
+          // spanContext contains the OpenTelemetry trace/span identifiers that are attached to
+          // the exported span payload and inherited by child spans.
+          spanId: randomHexId(16),
+          traceId: parentSpan?.spanContext.traceId || randomHexId(32),
+        },
       spanKind: options.kind || 'CLIENT',
       spanStatus: { code: 'UNSET' },
       status: 'pending',

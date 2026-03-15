@@ -8,6 +8,8 @@ Loupe is a lightweight local tracing dashboard for LLM applications and agent sy
 
 This package is for local development. Traces live in memory and are cleared on restart.
 
+Loupe can also mirror those spans into a real OpenTelemetry pipeline when you enable the optional bridge and your application has already configured an OpenTelemetry SDK/exporter.
+
 ## Why Loupe
 
 Most tracing tools assume hosted infrastructure, persistent storage, or production telemetry. Loupe is deliberately smaller:
@@ -47,6 +49,54 @@ Enable tracing:
 ```bash
 export LLM_TRACE_ENABLED=1
 ```
+
+### Development vs production
+
+Run the Loupe UI in development, and mirror the same spans into OpenTelemetry in production:
+
+```ts
+import OpenAI from 'openai';
+import { wrapOpenAIClient } from '@mtharrison/loupe';
+
+const client = wrapOpenAIClient(
+  new OpenAI(),
+  () => ({
+    sessionId: 'session-123',
+    rootActorId: 'support-assistant',
+    actorId: 'support-assistant',
+  }),
+  {
+    serverEnabled: process.env.NODE_ENV !== 'production',
+    otel: {
+      enabled: process.env.NODE_ENV === 'production',
+      tracerName: 'my-app.llm',
+    },
+  },
+);
+```
+
+When `otel.enabled` is true, Loupe loads `@opentelemetry/api` from your application and emits real spans through the active global tracer provider. Export to your collector or vendor is handled by your normal OpenTelemetry SDK setup, not by Loupe itself.
+
+If you prefer environment variables, set `LLM_TRACE_SERVER_ENABLED=0` in production and `LLM_TRACE_OTEL_ENABLED=1` where your OpenTelemetry SDK is configured.
+
+### Production OpenTelemetry setup
+
+Loupe does not bundle an OpenTelemetry SDK or exporter. Initialize that in your app and let Loupe write spans through the global API:
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+
+const sdk = new NodeSDK({
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+  }),
+});
+
+await sdk.start();
+```
+
+With that in place, Loupe-created spans flow to the same backend as the rest of your OpenTelemetry instrumentation whenever `otel.enabled` is on.
 
 If your app already uses a higher-level model interface or the official OpenAI client, Loupe can wrap that directly instead of requiring manual `record*` calls.
 

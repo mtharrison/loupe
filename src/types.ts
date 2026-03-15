@@ -6,7 +6,9 @@ export type SpanStatusCode = 'UNSET' | 'OK' | 'ERROR';
 export type TraceConfig = {
   host?: string;
   maxTraces?: number;
+  otel?: false | OpenTelemetryBridgeConfig;
   port?: number;
+  serverEnabled?: boolean;
   uiHotReload?: boolean;
 };
 
@@ -253,6 +255,38 @@ export type TraceFilters = {
   tagFilters?: string[];
   tags?: string[];
   traceIds?: string[];
+};
+
+export interface OpenTelemetrySpanLike {
+  addEvent?(name: string, attributes?: Record<string, any>): void;
+  end?(endTime?: number): void;
+  recordException?(exception: unknown): void;
+  setAttributes?(attributes: Record<string, any>): void;
+  setStatus?(status: { code: any; message?: string }): void;
+  spanContext?(): { spanId?: string; traceId?: string };
+}
+
+export interface OpenTelemetryTracerLike {
+  startSpan(name: string, options?: Record<string, any>, context?: unknown): OpenTelemetrySpanLike;
+}
+
+export interface OpenTelemetryApiLike {
+  SpanKind?: Record<string, any>;
+  SpanStatusCode?: Record<string, any>;
+  context?: {
+    active(): unknown;
+  };
+  trace?: {
+    getTracer(name: string, version?: string): OpenTelemetryTracerLike;
+    setSpan(context: unknown, span: OpenTelemetrySpanLike): unknown;
+  };
+}
+
+export type OpenTelemetryBridgeConfig = {
+  api?: OpenTelemetryApiLike;
+  enabled?: boolean;
+  tracerName?: string;
+  tracerVersion?: string;
 };
 
 export interface ChatModelLike<TInput = any, TOptions = any, TValue = any, TChunk = any> {

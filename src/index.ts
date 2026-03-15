@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { OpenTelemetryBridge } from './otel';
 import { createTraceServer } from './server';
 import { TraceStore } from './store';
 import { maybeStartUIWatcher } from './ui-build';
@@ -9,6 +10,7 @@ import {
   type OpenAIChatCompletionCreateParamsLike,
   type OpenAIChatCompletionStreamLike,
   type OpenAIClientLike,
+  type OpenTelemetryBridgeConfig,
   type SpanEventInput,
   type SpanStartOptions,
   type TraceConfig,
@@ -27,6 +29,10 @@ export type {
   OpenAIChatCompletionCreateParamsLike,
   OpenAIChatCompletionStreamLike,
   OpenAIClientLike,
+  OpenTelemetryApiLike,
+  OpenTelemetryBridgeConfig,
+  OpenTelemetrySpanLike,
+  OpenTelemetryTracerLike,
   SpanAttributes,
   SpanContext,
   SpanEvent,
@@ -252,6 +258,7 @@ export function wrapOpenAIClient<
 class LocalLLMTracerImpl implements LocalLLMTracer {
   config: Required<TraceConfig>;
   loggedUrl: boolean;
+  otelBridge: OpenTelemetryBridge;
   portWasExplicit: boolean;
   server: TraceServer | null;
   serverFailed: boolean;
@@ -264,12 +271,15 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     this.config = {
       host: '127.0.0.1',
       maxTraces: 1000,
+      otel: false,
       port: 4319,
+      serverEnabled: true,
       uiHotReload: false,
     };
     this.portWasExplicit = false;
     this.configure(config);
     this.store = new TraceStore({ maxTraces: this.config.maxTraces });
+    this.otelBridge = new OpenTelemetryBridge(resolveOpenTelemetryConfig(this.config.otel));
     this.server = null;
     this.serverInfo = null;
     this.serverStartPromise = null;
@@ -290,6 +300,13 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
       host: config.host || this.config.host || process.env.LLM_TRACE_HOST || '127.0.0.1',
       port: explicitPort ?? DEFAULT_TRACE_PORT,
       maxTraces: Number(config.maxTraces || this.config.maxTraces || process.env.LLM_TRACE_MAX_TRACES) || 1000,
+      otel: resolveOpenTelemetryConfig(config.otel, this.config.otel),
+      serverEnabled:
+        typeof config.serverEnabled === 'boolean'
+          ? config.serverEnabled
+          : process.env.LLM_TRACE_SERVER_ENABLED
+            ? envFlag('LLM_TRACE_SERVER_ENABLED')
+            : this.config.serverEnabled ?? true,
       uiHotReload:
         typeof config.uiHotReload === 'boolean'
           ? config.uiHotReload
@@ -301,6 +318,10 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     if (this.store) {
       this.store.maxTraces = this.config.maxTraces;
     }
+
+    if (this.otelBridge) {
+      this.otelBridge.configure(resolveOpenTelemetryConfig(this.config.otel));
+    }
   }
 
   isEnabled(): boolean {
@@ -308,13 +329,27 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
   }
 
   startSpan(context: TraceContext, options: SpanStartOptions = {}): string {
-    void this.startServer();
+    if (this.config.serverEnabled) {
+      void this.startServer();
+    }
     const parentSpanId = options.parentSpanId || activeSpanStorage.getStore() || null;
-    return this.store.startSpan(context as any, {
-      ...options,
-      parentSpanId,
-      request: normaliseRequest(options.request || {}),
+    const mode = options.mode || 'invoke';
+    const request = normaliseRequest(options.request || {});
+    const name = options.name || `${context?.provider || 'llm'}.${mode}`;
+    const otelHandle = this.otelBridge.startSpan({
+      kind: options.kind || 'CLIENT',
+      name,
+      parentLocalSpanId: parentSpanId,
     });
+    const traceId = this.store.startSpan(context as any, {
+      ...options,
+      name,
+      parentSpanId,
+      request,
+      spanContext: otelHandle?.spanContext || undefined,
+    });
+    this.otelBridge.attach(traceId, otelHandle, this.store.get(traceId));
+    return traceId;
   }
 
   runWithActiveSpan<T>(spanId: string, callback: () => T): T {
@@ -323,18 +358,21 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
 
   addSpanEvent(spanId: string, event: SpanEventInput) {
     this.store.addSpanEvent(spanId, safeClone(event));
+    this.otelBridge.addEvent(spanId, safeClone(event));
   }
 
   endSpan(spanId: string, response?: unknown) {
     this.store.endSpan(spanId, safeClone(response));
+    this.otelBridge.finishSpan(spanId, this.store.get(spanId));
   }
 
   recordException(spanId: string, error: unknown) {
     this.store.recordException(spanId, error);
+    this.otelBridge.finishSpan(spanId, this.store.get(spanId), error);
   }
 
   startServer(): Promise<{ host: string; port: number; url: string } | null> {
-    if (!this.isEnabled() || this.serverFailed) {
+    if (!this.isEnabled() || this.serverFailed || !this.config.serverEnabled) {
       return Promise.resolve(this.serverInfo);
     }
 
@@ -408,6 +446,38 @@ function getConfiguredPort(
   }
 
   return typeof currentExplicitPort === 'number' && Number.isFinite(currentExplicitPort) ? currentExplicitPort : undefined;
+}
+
+function resolveOpenTelemetryConfig(
+  config?: false | OpenTelemetryBridgeConfig,
+  current?: false | OpenTelemetryBridgeConfig,
+): OpenTelemetryBridgeConfig {
+  const currentConfig = current || {};
+
+  if (config === false) {
+    return {
+      enabled: false,
+      tracerName: currentConfig.tracerName || '@mtharrison/loupe',
+      tracerVersion: currentConfig.tracerVersion,
+    };
+  }
+
+  const hasConfigObject = Boolean(config && Object.keys(config).length > 0);
+  const enabled =
+    typeof config?.enabled === 'boolean'
+      ? config.enabled
+      : process.env.LLM_TRACE_OTEL_ENABLED
+        ? envFlag('LLM_TRACE_OTEL_ENABLED')
+        : hasConfigObject
+          ? true
+          : Boolean(currentConfig.enabled);
+
+  return {
+    api: config?.api || currentConfig.api,
+    enabled,
+    tracerName: config?.tracerName || process.env.LLM_TRACE_OTEL_TRACER_NAME || currentConfig.tracerName || '@mtharrison/loupe',
+    tracerVersion: config?.tracerVersion || process.env.LLM_TRACE_OTEL_TRACER_VERSION || currentConfig.tracerVersion,
+  };
 }
 
 function withOpenAITraceContext(context: TraceContext | undefined, params: OpenAIChatCompletionCreateParamsLike | undefined): TraceContext {

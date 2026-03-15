@@ -257,6 +257,110 @@ test('nested wrapped model calls create child spans on the same trace', async ()
   assert.equal(inner.spanContext.traceId, outer.spanContext.traceId);
 });
 
+test('OpenTelemetry bridge mirrors spans and can disable the local server', async () => {
+  process.env.LLM_TRACE_ENABLED = '1';
+  const started = [];
+  const ended = [];
+
+  function createSpan(name, options, context) {
+    const index = started.length;
+    const span = {
+      _attributes: {},
+      _events: [],
+      _status: null,
+      _endTime: null,
+      _exception: null,
+      _name: name,
+      _kind: options && options.kind,
+      _parent: context || null,
+      addEvent(eventName, attributes) {
+        this._events.push({ attributes, name: eventName });
+      },
+      end(endTime) {
+        this._endTime = endTime;
+        ended.push(this);
+      },
+      recordException(exception) {
+        this._exception = exception;
+      },
+      setAttributes(attributes) {
+        this._attributes = { ...this._attributes, ...attributes };
+      },
+      setStatus(status) {
+        this._status = status;
+      },
+      spanContext() {
+        return {
+          spanId: index === 0 ? '1111111111111111' : '2222222222222222',
+          traceId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        };
+      },
+    };
+    started.push(span);
+    return span;
+  }
+
+  const fakeApi = {
+    SpanKind: { CLIENT: 'CLIENT' },
+    SpanStatusCode: { ERROR: 'ERROR', OK: 'OK', UNSET: 'UNSET' },
+    context: {
+      active() {
+        return { type: 'active-context' };
+      },
+    },
+    trace: {
+      getTracer() {
+        return { startSpan: createSpan };
+      },
+      setSpan(context, span) {
+        return { parentContext: context, parentSpan: span };
+      },
+    },
+  };
+
+  const tracer = getLocalLLMTracer({
+    otel: { api: fakeApi, tracerName: 'test.loupe' },
+    port: reservePort(),
+    serverEnabled: false,
+  });
+  tracer.store.clear();
+
+  const parentId = tracer.startSpan(
+    { sessionId: 'otel-session', rootActorId: 'root', actorId: 'root', provider: 'openai', model: 'gpt-4.1' },
+    { mode: 'invoke', name: 'openai.chat.completions', request: { input: { messages: [{ role: 'user', content: 'hello' }] }, options: {} } },
+  );
+  tracer.addSpanEvent(parentId, {
+    name: 'stream.chunk',
+    attributes: { content: 'hi', nested: { ok: true } },
+  });
+
+  const childId = tracer.startSpan(
+    { sessionId: 'otel-session', rootActorId: 'root', actorId: 'tool-worker', provider: 'openai', model: 'gpt-4.1-mini' },
+    { mode: 'invoke', name: 'child.call', parentSpanId: parentId, request: { input: { messages: [{ role: 'user', content: 'tool' }] }, options: {} } },
+  );
+  tracer.recordException(childId, new Error('boom'));
+  tracer.endSpan(parentId, {
+    message: { role: 'assistant', content: 'world' },
+    tool_calls: [],
+    usage: { tokens: { prompt: 1, completion: 2 } },
+  });
+
+  const parentTrace = tracer.store.get(parentId);
+  const childTrace = tracer.store.get(childId);
+
+  assert.equal(tracer.server, null);
+  assert.equal(parentTrace.spanContext.traceId, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(parentTrace.spanContext.spanId, '1111111111111111');
+  assert.equal(childTrace.spanContext.spanId, '2222222222222222');
+  assert.equal(started[1]._parent.parentSpan, started[0]);
+  assert.equal(started[0]._events[0].attributes.nested, '{"ok":true}');
+  assert.equal(started[0]._attributes['gen_ai.usage.output_tokens'], 2);
+  assert.equal(started[0]._status.code, 'OK');
+  assert.equal(started[1]._status.code, 'ERROR');
+  assert.equal(started[1]._exception.message, 'boom');
+  assert.equal(ended.length, 2);
+});
+
 test('hierarchy nests sessions, actors, child actors, stages, and guardrails', async () => {
   const tracer = getLocalLLMTracer({ maxTraces: 10 });
   tracer.store.clear();
