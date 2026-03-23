@@ -208,7 +208,7 @@ test('NODE_ENV=development enables tracing implicitly', async () => {
   assert.equal(traces[0].status, 'ok');
 });
 
-test('NODE_ENV=development opens the dashboard automatically on first server start', async () => {
+test('NODE_ENV=development opens the dashboard automatically when the tracer is created', async () => {
   process.env.NODE_ENV = 'development';
   const originalIsTTY = process.stdout.isTTY;
   const originalSpawn = childProcess.spawn;
@@ -225,7 +225,6 @@ test('NODE_ENV=development opens the dashboard automatically on first server sta
   try {
     const port = reservePort();
     const tracer = getLocalLLMTracer({ maxTraces: 10, port, uiHotReload: false });
-    await tracer.startServer();
     await tracer.startServer();
 
     assert.equal(calls.length, 1);

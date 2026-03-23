@@ -50,7 +50,7 @@ Enable tracing explicitly:
 export LLM_TRACE_ENABLED=1
 ```
 
-Or just run your app with `NODE_ENV=development`. Loupe now enables tracing implicitly in development and opens the dashboard automatically on first start in an interactive local terminal.
+Or just run your app with `NODE_ENV=development`. Loupe enables tracing implicitly in development and eagerly starts the dashboard when the tracer is first created, opening it automatically in an interactive local terminal.
 
 If your app already uses a higher-level model interface or the official OpenAI client, Loupe can wrap that directly instead of requiring manual `record*` calls.
 
@@ -89,7 +89,7 @@ for await (const chunk of stream) {
 }
 ```
 
-If you do not call `startServer()` yourself, the dashboard starts lazily on the first recorded trace.
+In `NODE_ENV=development`, you do not need to call `startServer()` explicitly. Creating the tracer is enough to start the dashboard.
 
 When the server starts, Loupe prints the local URL:
 

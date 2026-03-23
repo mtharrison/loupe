@@ -71,6 +71,10 @@ export function getLocalLLMTracer(config: TraceConfig = {}): LocalLLMTracer {
     singleton.configure(config);
   }
 
+  if (shouldEagerStartDashboard()) {
+    void singleton.startServer();
+  }
+
   return singleton;
 }
 
@@ -401,6 +405,10 @@ function shouldAutoOpenDashboard(): boolean {
     && !process.env.CI
     && !!process.stdout.isTTY
   );
+}
+
+function shouldEagerStartDashboard(): boolean {
+  return process.env.NODE_ENV === 'development';
 }
 
 function openBrowser(url: string) {
