@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import * as childProcess from 'node:child_process';
 import { createTraceServer } from './server';
 import { TraceStore } from './store';
 import { maybeStartUIWatcher } from './ui-build';
@@ -56,7 +57,11 @@ const DEFAULT_TRACE_PORT = 4319;
 const activeSpanStorage = new AsyncLocalStorage<string | null>();
 
 export function isTraceEnabled(): boolean {
-  return envFlag('LLM_TRACE_ENABLED');
+  if (process.env.LLM_TRACE_ENABLED !== undefined) {
+    return envFlag('LLM_TRACE_ENABLED');
+  }
+
+  return process.env.NODE_ENV === 'development';
 }
 
 export function getLocalLLMTracer(config: TraceConfig = {}): LocalLLMTracer {
@@ -252,6 +257,7 @@ export function wrapOpenAIClient<
 class LocalLLMTracerImpl implements LocalLLMTracer {
   config: Required<TraceConfig>;
   loggedUrl: boolean;
+  openedBrowser: boolean;
   portWasExplicit: boolean;
   server: TraceServer | null;
   serverFailed: boolean;
@@ -275,6 +281,7 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     this.serverStartPromise = null;
     this.serverFailed = false;
     this.loggedUrl = false;
+    this.openedBrowser = false;
     this.uiWatcher = null;
   }
 
@@ -366,6 +373,10 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
           this.loggedUrl = true;
           process.stdout.write(`[llm-trace] dashboard: ${this.serverInfo.url}\n`);
         }
+        if (!this.openedBrowser && this.serverInfo && shouldAutoOpenDashboard()) {
+          this.openedBrowser = true;
+          openBrowser(this.serverInfo.url);
+        }
         return this.serverInfo;
       } catch (error: any) {
         this.serverFailed = true;
@@ -377,6 +388,45 @@ class LocalLLMTracerImpl implements LocalLLMTracer {
     })();
 
     return this.serverStartPromise;
+  }
+}
+
+function shouldAutoOpenDashboard(): boolean {
+  if (process.env.LOUPE_OPEN_BROWSER === '0') {
+    return false;
+  }
+
+  return (
+    process.env.NODE_ENV === 'development'
+    && !process.env.CI
+    && !!process.stdout.isTTY
+    && process.env.NODE_ENV !== 'test'
+  );
+}
+
+function openBrowser(url: string) {
+  const command =
+    process.platform === 'darwin'
+      ? ['open', [url]]
+      : process.platform === 'win32'
+        ? ['cmd', ['/c', 'start', '', url]]
+        : process.platform === 'linux'
+          ? ['xdg-open', [url]]
+          : null;
+
+  if (!command) {
+    return;
+  }
+
+  try {
+    const child = childProcess.spawn(command[0], command[1], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch (_error) {
+    // Ignore browser launch failures. The dashboard URL is already printed.
   }
 }
 

@@ -158,7 +158,9 @@ export function normalizeTraceContext(context: TraceContext | undefined, mode: T
 
   let kind = explicitKind || 'actor';
   if (!explicitKind) {
-    if (guardrailType || guardrailPhase) {
+    // Keep generic guardrail metadata from masking actual delegated-agent spans.
+    // Explicit guardrail spans or spans with a concrete phase still remain guardrails.
+    if (guardrailPhase || (guardrailType && !isChildActor)) {
       kind = 'guardrail';
     } else if (stage) {
       kind = 'stage';

@@ -175,10 +175,6 @@ const MESSAGE_COLLAPSE_LINE_LIMIT_SYSTEM = 5;
 const MESSAGE_COLLAPSE_HEIGHT_PROSE_SYSTEM = "9rem";
 const MESSAGE_COLLAPSE_HEIGHT_STRUCTURED_SYSTEM = "9rem";
 const TIMELINE_AXIS_STOPS = [0, 0.25, 0.5, 0.75, 1];
-const EMPTY_TRACE_INSIGHTS: TraceInsights = {
-  highlights: [],
-  structuredInputs: [],
-};
 const MarkdownBlock = lazy(() =>
   import("./markdown-block").then((module) => ({
     default: module.MarkdownBlock,
@@ -214,6 +210,7 @@ type HierarchyTimelineRow = {
   costUsd: number | null;
   depth: number;
   durationMs: number;
+  guardrailPhase: string | null;
   hasHighlights: boolean;
   hasStructuredInput: boolean;
   hasVisibleChildren: boolean;
@@ -224,10 +221,16 @@ type HierarchyTimelineRow = {
   isLastSibling: boolean;
   label: string;
   meta: string;
+  model: string | null;
   offsetMs: number;
+  provider: string | null;
   startedAt: string;
+  traceId: string | null;
+  traceKind: string | null;
   type: string;
 };
+
+type GuardrailVisibility = "compact" | "hidden";
 
 type HierarchyTimelineModel = {
   costUsd: number | null;
@@ -237,10 +240,20 @@ type HierarchyTimelineModel = {
   startedAt: string;
 };
 
-type MessageInsightMatches = {
-  highlights: TraceInsights["highlights"];
-  structuredInputs: TraceInsights["structuredInputs"];
-};
+type HierarchyTimelineDisplayItem =
+  | {
+      compact: boolean;
+      id: string;
+      kind: "row";
+      row: HierarchyTimelineRow;
+    }
+  | {
+      id: string;
+      isExpanded: boolean;
+      itemCount: number;
+      kind: "guardrail-group";
+      row: HierarchyTimelineRow;
+    };
 
 const STATUS_OPTIONS = [
   { label: "All statuses", value: "" },
@@ -1158,14 +1171,6 @@ function getSessionNavBadge(item: SessionNavItem): ReactNode {
     return <Badge variant="warning">Running</Badge>;
   }
 
-  if (item.hasHighlights) {
-    return (
-      <Badge variant="secondary" semantic="guardrail">
-        Insight
-      </Badge>
-    );
-  }
-
   return null;
 }
 
@@ -1437,9 +1442,30 @@ function SessionHierarchyBranch({
     sessionSelectedPath as HierarchyNode[],
     selectedTraceId,
   );
+  const [showGuardrails, setShowGuardrails] = useState(true);
   const sessionTimelineRow = sessionTimelineModel?.rows[0] ?? null;
+  const embeddedTimelineRows = useMemo(() => {
+    if (!sessionTimelineModel) {
+      return [];
+    }
+
+    const visibleRows = sessionTimelineModel.rows.slice(1);
+    const baseDepth = visibleRows[0]?.depth ?? 0;
+    if (baseDepth <= 0) {
+      return visibleRows;
+    }
+
+    return visibleRows.map((row) => ({
+      ...row,
+      depth: Math.max(0, row.depth - baseDepth),
+      ancestorContinuations: row.ancestorContinuations.slice(baseDepth),
+    }));
+  }, [sessionTimelineModel]);
+  const guardrailRowCount = embeddedTimelineRows.filter((row) =>
+    isGuardrailTimelineRow(row),
+  ).length;
   const showEmbeddedTimeline =
-    isExpanded && Boolean(sessionTimelineModel?.rows.length);
+    isExpanded && embeddedTimelineRows.length > 0;
 
   return (
     <div
@@ -1508,6 +1534,25 @@ function SessionHierarchyBranch({
       </div>
       {showEmbeddedTimeline && sessionTimelineModel ? (
         <div className="session-tree-timeline-shell">
+          {guardrailRowCount ? (
+            <div className="session-tree-timeline-toolbar">
+              <span className="session-tree-timeline-toolbar-copy">
+                {formatCountLabel(guardrailRowCount, "guardrail check")}{" "}
+                {showGuardrails ? "compact" : "hidden"}
+              </span>
+              <BadgeButton
+                variant="outline"
+                semantic="guardrail"
+                onClick={() =>
+                  startTransition(() =>
+                    setShowGuardrails((current) => !current),
+                  )
+                }
+              >
+                {showGuardrails ? "Hide guardrails" : "Show guardrails"}
+              </BadgeButton>
+            </div>
+          ) : null}
           <div
             className="session-tree-timeline-list"
             role="list"
@@ -1515,6 +1560,7 @@ function SessionHierarchyBranch({
           >
             <HierarchyTimelineRows
               className="is-embedded"
+              guardrailVisibility={showGuardrails ? "compact" : "hidden"}
               model={sessionTimelineModel}
               onSelectRow={(nodeId) => {
                 const selectedTimelineNode = findSessionNodeById([node], nodeId);
@@ -1522,7 +1568,7 @@ function SessionHierarchyBranch({
                   onSelect(selectedTimelineNode as HierarchyNode);
                 }
               }}
-              rows={sessionTimelineModel.rows.slice(1)}
+              rows={embeddedTimelineRows}
             />
           </div>
         </div>
@@ -1787,7 +1833,15 @@ function HierarchyTimelineOverview({
     model.costUsd,
     model.rows.length > 1,
   );
-  const hasTraceRows = model.rows.some((row) => row.type === "trace");
+  const [showGuardrails, setShowGuardrails] = useState(true);
+  const hasTraceRows = model.rows.some(
+    (row) =>
+      row.type === "trace" &&
+      (showGuardrails || !isGuardrailTimelineRow(row)),
+  );
+  const guardrailRowCount = model.rows.filter((row) =>
+    isGuardrailTimelineRow(row),
+  ).length;
   const activeRowId =
     model.rows.find((row) => row.isActive)?.id ??
     model.rows.find((row) => row.isDetailTrace)?.id ??
@@ -1845,6 +1899,19 @@ function HierarchyTimelineOverview({
           <TraceMetricPill tone="latency">
             {formatElapsedLabel(model.durationMs)}
           </TraceMetricPill>
+          {guardrailRowCount ? (
+            <BadgeButton
+              variant="outline"
+              semantic="guardrail"
+              onClick={() =>
+                startTransition(() =>
+                  setShowGuardrails((current) => !current),
+                )
+              }
+            >
+              {showGuardrails ? "Hide guardrails" : "Show guardrails"}
+            </BadgeButton>
+          ) : null}
         </div>
       </div>
 
@@ -1881,6 +1948,7 @@ function HierarchyTimelineOverview({
         aria-label="Nested session timeline"
       >
         <HierarchyTimelineRows
+          guardrailVisibility={showGuardrails ? "compact" : "hidden"}
           model={model}
           onSelectRow={onSelectRow}
           rows={model.rows}
@@ -1892,29 +1960,61 @@ function HierarchyTimelineOverview({
 
 function HierarchyTimelineRows({
   className,
+  guardrailVisibility = "compact",
   model,
   onSelectRow,
   rows,
 }: {
   className?: string;
+  guardrailVisibility?: GuardrailVisibility;
   model: HierarchyTimelineModel;
   onSelectRow: (nodeId: string) => void;
   rows: HierarchyTimelineRow[];
 }) {
-  return rows.map((row) => {
-    const isTraceRow = row.type === "trace";
+  const [expandedGuardrailGroups, setExpandedGuardrailGroups] = useState<
+    Record<string, boolean>
+  >({});
+  const displayItems = useMemo(
+    () =>
+      buildHierarchyTimelineDisplayItems(
+        rows,
+        guardrailVisibility,
+        expandedGuardrailGroups,
+      ),
+    [expandedGuardrailGroups, guardrailVisibility, rows],
+  );
+
+  if (!displayItems.length) {
+    return (
+      <div className="hierarchy-timeline-empty-state">
+        No visible rows. Show guardrails to inspect them.
+      </div>
+    );
+  }
+
+  return displayItems.map((item) => {
+    const row = item.row;
+    const isEmbeddedRow = className?.includes("is-embedded") ?? false;
+    const hasSemanticIndent =
+      isEmbeddedRow && row.type === "trace" && row.traceKind === "child-actor";
+    const isTraceRow = item.kind === "row" && row.type === "trace";
     const rowClassName = cn(
       "hierarchy-timeline-row",
       className,
-      isTraceRow ? "is-clickable" : "is-structure",
+      (isTraceRow || item.kind === "guardrail-group") && "is-clickable",
+      !isTraceRow && item.kind !== "guardrail-group" && "is-structure",
       row.depth === 0 && "is-root",
       row.isActive && "is-active",
       row.isDetailTrace && "is-detail-trace",
       row.isInPath && "is-in-path",
+      hasSemanticIndent && "has-semantic-indent is-child-actor-trace",
+      row.traceKind === "guardrail" && "is-guardrail-trace",
+      item.kind === "guardrail-group" && "is-structure is-guardrail-group",
+      item.kind === "row" && item.compact && "is-guardrail-compact",
       `is-${row.type.replace(/[^a-z0-9-]/gi, "-")}`,
     );
     const rowStyle = {
-      "--timeline-depth": String(row.depth),
+      "--timeline-depth": String(row.depth + (hasSemanticIndent ? 1 : 0)),
       "--timeline-offset": String(
         model.durationMs > 0 ? row.offsetMs / model.durationMs : 0,
       ),
@@ -1972,24 +2072,17 @@ function HierarchyTimelineRows({
               <Badge
                 variant="secondary"
                 className="hierarchy-timeline-pill"
-                semantic={row.badge}
+                semantic={
+                  item.kind === "guardrail-group" || row.traceKind === "guardrail"
+                    ? "guardrail"
+                    : row.badge
+                }
               >
-                {row.badge}
+                {item.kind === "guardrail-group" ? "Guardrail" : row.badge}
               </Badge>
-              {row.hasStructuredInput ? (
-                <span
-                  className="hierarchy-timeline-row-flag"
-                  title="Structured input detected for this call"
-                >
-                  Structured input
-                </span>
-              ) : null}
-              {row.hasHighlights && !row.hasStructuredInput ? (
-                <span
-                  className="hierarchy-timeline-row-flag is-highlight"
-                  title="Trace insights available"
-                >
-                  Insight
+              {item.kind === "guardrail-group" ? (
+                <span className="hierarchy-timeline-row-toggle-label">
+                  {item.isExpanded ? "Hide" : `Show ${item.itemCount}`}
                 </span>
               ) : null}
             </div>
@@ -2006,6 +2099,38 @@ function HierarchyTimelineRows({
         </div>
       </Fragment>
     );
+
+    if (item.kind === "guardrail-group") {
+      return (
+        <div
+          key={item.id}
+          role="listitem"
+          title={buildHierarchyTimelineRowTooltip(row)}
+          data-hierarchy-row-id={row.id}
+        >
+          <button
+            type="button"
+            className={rowClassName}
+            style={rowStyle}
+            onClick={() =>
+              startTransition(() =>
+                setExpandedGuardrailGroups((current) =>
+                  current[item.id]
+                    ? Object.fromEntries(
+                        Object.entries(current).filter(
+                          ([key]) => key !== item.id,
+                        ),
+                      )
+                    : { ...current, [item.id]: true },
+                ),
+              )
+            }
+          >
+            {rowContent}
+          </button>
+        </div>
+      );
+    }
 
     if (isTraceRow) {
       return (
@@ -2365,10 +2490,8 @@ function renderTabContent(
       return (
         <div className="detail-grid">
           <MessagesCard
-            insights={detail.insights}
             title="Request messages"
             messages={requestMessages}
-            sourcePrefix="request"
           />
           <JsonCard title="Request options" value={detail.request.options} />
           {(detail.request.input?.tools || []).length ? (
@@ -2398,10 +2521,8 @@ function renderTabContent(
         <div className="detail-grid">
           {responseMessage ? (
             <MessagesCard
-              insights={detail.insights}
               title="Assistant message"
               messages={[responseMessage]}
-              sourcePrefix="response"
             />
           ) : null}
           {toolCalls.length ? (
@@ -2468,10 +2589,8 @@ function renderTabContent(
           <StreamTimelineCard detail={detail} />
           {detail.stream.reconstructed?.message ? (
             <MessagesCard
-              insights={detail.insights}
               title="Reconstructed output"
               messages={[detail.stream.reconstructed.message as any]}
-              sourcePrefix="stream"
             />
           ) : null}
           {detail.stream.reconstructed?.tool_calls?.length ? (
@@ -2518,7 +2637,6 @@ function ConversationView({
   );
   const costUsd = getUsageCostUsd(detail.usage);
   const costLabel = formatUsdCost(costUsd);
-  const traceInsights = detail.insights ?? EMPTY_TRACE_INSIGHTS;
 
   return (
     <div className="conversation-layout">
@@ -2582,18 +2700,12 @@ function ConversationView({
         </div>
       </div>
 
-      {traceInsights.highlights.length || traceInsights.structuredInputs.length ? (
-        <TraceInsightsSummary detail={detail} insights={traceInsights} />
-      ) : null}
-
       <div className="conversation-thread">
         {requestMessages.length ? (
           requestMessages.map((message, index) => (
             <ConversationMessage
               key={`${message.role}-${index}`}
-              insights={traceInsights}
               message={message}
-              source={`request:${index}`}
             />
           ))
         ) : (
@@ -2602,12 +2714,10 @@ function ConversationView({
 
         {hasRenderableContent(responseMessage?.content) ? (
           <ConversationMessage
-            insights={traceInsights}
             message={{
               role: responseMessage?.role || "assistant",
               content: responseMessage?.content,
             }}
-            source="response:0"
           />
         ) : null}
 
@@ -2625,77 +2735,9 @@ function ConversationView({
   );
 }
 
-function TraceInsightsSummary({
-  detail,
-  insights,
-}: {
-  detail: TraceRecord;
-  insights: TraceInsights;
-}) {
-  const title =
-    detail.kind === "guardrail" ? "Why this guardrail ran" : "Trace insights";
-  const highlights = insights.highlights.filter(
-    (item) => item.kind !== "structured-input" || !insights.structuredInputs.length,
-  );
-
-  return (
-    <Card className="detail-section trace-insights-card">
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        <CardDescription>
-          Deterministic signals extracted from the trace payload.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="trace-insights-content">
-        {highlights.map((highlight, index) => (
-          <div
-            key={`${highlight.kind}-${highlight.source}-${index}`}
-            className="trace-insight-item"
-          >
-            <div className="trace-insight-item-header">
-              <Badge semantic="guardrail" variant="secondary">
-                {highlight.title}
-              </Badge>
-              <span className="trace-insight-item-source">
-                {formatInsightSource(highlight.source)}
-              </span>
-            </div>
-            <div className="trace-insight-item-copy">
-              {highlight.description}
-            </div>
-          </div>
-        ))}
-        {insights.structuredInputs.map((item, index) => (
-          <div
-            key={`${item.role}-${item.snippet}-${index}`}
-            className="trace-insight-item is-structured"
-          >
-            <div className="trace-insight-item-header">
-              <Badge semantic="guardrail" variant="secondary">
-                Structured {item.role} input
-              </Badge>
-              <div className="trace-insight-item-tags">
-                {item.tags.map((tag) => (
-                  <Badge key={tag} variant="outline">
-                    {tag}
-                  </Badge>
-                ))}
-              </div>
-            </div>
-            <div className="trace-insight-item-copy">{item.snippet}</div>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
-  );
-}
-
 function ConversationMessage({
-  insights = EMPTY_TRACE_INSIGHTS,
   message,
-  source,
 }: {
-  insights?: TraceInsights;
   message: {
     content: any;
     role: string;
@@ -2703,7 +2745,6 @@ function ConversationMessage({
     tool_call_id?: string;
     tool_calls?: any[];
   };
-  source: string;
 }) {
   const toolCalls = getMessageToolCalls(message);
 
@@ -2718,20 +2759,10 @@ function ConversationMessage({
   }
 
   if (toolCalls.length) {
-    const messageInsights = getMessageInsightMatches(
-      insights,
-      source,
-      message.role,
-      message.content,
-    );
     return (
       <Fragment>
         {hasRenderableContent(message.content) ? (
-          <ConversationBubble
-            role={message.role}
-            content={message.content}
-            insights={messageInsights}
-          />
+          <ConversationBubble role={message.role} content={message.content} />
         ) : null}
         {toolCalls.map((toolCall, index) => (
           <ToolCallBubble
@@ -2750,29 +2781,14 @@ function ConversationMessage({
     return null;
   }
 
-  const messageInsights = getMessageInsightMatches(
-    insights,
-    source,
-    message.role,
-    message.content,
-  );
-
-  return (
-    <ConversationBubble
-      content={message.content}
-      insights={messageInsights}
-      role={message.role}
-    />
-  );
+  return <ConversationBubble content={message.content} role={message.role} />;
 }
 
 function ConversationBubble({
   content,
-  insights,
   role,
 }: {
   content: any;
-  insights: MessageInsightMatches;
   role: string;
 }) {
   const tone =
@@ -2786,9 +2802,6 @@ function ConversationBubble({
     <div className={clsx("conversation-row", tone)}>
       <div className="conversation-role">{role}</div>
       <div className="conversation-bubble">
-        {insights.structuredInputs.length || insights.highlights.length ? (
-          <MessageInsightBanner insights={insights} />
-        ) : null}
         <RichMessageContent content={content} role={role} />
       </div>
     </div>
@@ -2840,84 +2853,6 @@ function ToolCallBubble({ index, toolCall }: { index: number; toolCall: any }) {
       </div>
     </div>
   );
-}
-
-function MessageInsightBanner({
-  insights,
-}: {
-  insights: MessageInsightMatches;
-}) {
-  return (
-    <div className="message-insight-banner">
-      {insights.structuredInputs.map((item, index) => (
-        <div
-          key={`${item.role}-${item.snippet}-${index}`}
-          className="message-insight-card"
-        >
-          <div className="message-insight-card-header">
-            <Badge semantic="guardrail" variant="secondary">
-              Structured input
-            </Badge>
-            <div className="message-insight-card-tags">
-              {item.tags.slice(0, 3).map((tag) => (
-                <Badge key={tag} variant="outline">
-                  {tag}
-                </Badge>
-              ))}
-            </div>
-          </div>
-          <div className="message-insight-card-copy">
-            XML-like markup detected in this {item.role} message.
-          </div>
-        </div>
-      ))}
-      {insights.highlights.map((highlight, index) => (
-        <div
-          key={`${highlight.kind}-${highlight.source}-${index}`}
-          className="message-insight-card is-highlight"
-        >
-          <div className="message-insight-card-header">
-            <Badge semantic="guardrail" variant="secondary">
-              {highlight.title}
-            </Badge>
-          </div>
-          <div className="message-insight-card-copy">
-            {highlight.description}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function getMessageInsightMatches(
-  insights: TraceInsights,
-  source: string,
-  role: string,
-  content: any,
-): MessageInsightMatches {
-  const text = extractPlainMessageText(content);
-  const normalizedText = text ? text.replace(/\s+/g, " ") : null;
-  const structuredInputs = insights.structuredInputs.filter(
-    (item) =>
-      item.role === role &&
-      normalizedText !== null &&
-      normalizedText.includes(item.snippet.replace(/\.\.\.$/, "")),
-  );
-
-  return {
-    highlights: insights.highlights.filter(
-      (highlight) =>
-        !(highlight.kind === "structured-input" && structuredInputs.length) &&
-        (
-          highlight.source === source ||
-          (normalizedText !== null &&
-            highlight.snippet.length > 0 &&
-            normalizedText.includes(highlight.snippet.replace(/\.\.\.$/, "")))
-        ),
-    ),
-    structuredInputs,
-  };
 }
 
 function RichMessageContent({
@@ -3482,14 +3417,10 @@ function MetadataActionButton({
 }
 
 function MessagesCard({
-  insights = EMPTY_TRACE_INSIGHTS,
   messages,
-  sourcePrefix,
   title,
 }: {
-  insights?: TraceInsights;
   messages: Array<{ content: any; role: string }>;
-  sourcePrefix: "request" | "response" | "stream";
   title: string;
 }) {
   return (
@@ -3502,9 +3433,7 @@ function MessagesCard({
           messages.map((message, index) => (
             <StructuredMessageCard
               key={`${message.role}-${index}`}
-              insights={insights}
               message={message}
-              source={`${sourcePrefix}:${index}`}
             />
           ))
         ) : (
@@ -3535,11 +3464,8 @@ function ToolCallsCard({
 }
 
 function StructuredMessageCard({
-  insights = EMPTY_TRACE_INSIGHTS,
   message,
-  source,
 }: {
-  insights?: TraceInsights;
   message: {
     content: any;
     name?: string;
@@ -3547,18 +3473,11 @@ function StructuredMessageCard({
     tool_call_id?: string;
     tool_calls?: any[];
   };
-  source: string;
 }) {
   const toolCalls = getMessageToolCalls(message);
   const hasContent = hasRenderableContent(message.content);
   const isToolCallTurn = toolCalls.length > 0;
   const isToolResult = message.role === "tool";
-  const messageInsights = getMessageInsightMatches(
-    insights,
-    source,
-    message.role,
-    message.content,
-  );
 
   return (
     <div className={cn("message-card", `role-${message.role}`)}>
@@ -3581,9 +3500,6 @@ function StructuredMessageCard({
         </div>
       </div>
       <div className="message-card-body">
-        {messageInsights.structuredInputs.length || messageInsights.highlights.length ? (
-          <MessageInsightBanner insights={messageInsights} />
-        ) : null}
         {hasContent ? (
           <RichMessageContent content={message.content} role={message.role} />
         ) : isToolCallTurn ? (
@@ -3997,7 +3913,9 @@ function getTraceTitle(
   }
 
   if (trace.kind === "child-actor") {
-    return `Child actor ${trace.mode}`;
+    return trace.hierarchy.childActorId
+      ? `Child actor ${trace.mode}: ${trace.hierarchy.childActorId}`
+      : `Child actor ${trace.mode}`;
   }
 
   if (trace.kind === "actor") {
@@ -4329,6 +4247,7 @@ function buildHierarchyTimelineModel(
       costUsd: getHierarchyNodeCostUsd(node),
       depth,
       durationMs: timing.durationMs,
+      guardrailPhase: trace?.hierarchy.guardrailPhase ?? null,
       hasHighlights: Boolean(trace?.flags?.hasHighlights),
       hasStructuredInput: Boolean(trace?.flags?.hasStructuredInput),
       hasVisibleChildren: children.length > 0,
@@ -4339,8 +4258,12 @@ function buildHierarchyTimelineModel(
       isLastSibling,
       label: copy.label,
       meta: copy.meta,
+      model: trace?.model ?? null,
       offsetMs: Math.max(0, timing.startMs - rootTiming.startMs),
+      provider: trace?.provider ?? null,
       startedAt: timing.startedAt,
+      traceId: node.meta?.traceId ?? null,
+      traceKind: trace?.kind ?? null,
       type: node.type,
     });
 
@@ -4363,6 +4286,176 @@ function buildHierarchyTimelineModel(
     sessionLabel: getHierarchyNodeCopy(rootNode, traceById).label,
     startedAt: rootTiming.startedAt,
   };
+}
+
+function isGuardrailTimelineRow(
+  row: Pick<HierarchyTimelineRow, "traceKind" | "type">,
+): boolean {
+  return row.type === "trace" && row.traceKind === "guardrail";
+}
+
+function buildHierarchyTimelineDisplayItems(
+  rows: HierarchyTimelineRow[],
+  guardrailVisibility: GuardrailVisibility,
+  expandedGuardrailGroups: Record<string, boolean>,
+): HierarchyTimelineDisplayItem[] {
+  const items: HierarchyTimelineDisplayItem[] = [];
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (!isGuardrailTimelineRow(row)) {
+      items.push({ compact: false, id: row.id, kind: "row", row });
+      continue;
+    }
+
+    let groupEnd = index + 1;
+    while (
+      groupEnd < rows.length &&
+      isGuardrailTimelineRow(rows[groupEnd]) &&
+      rows[groupEnd].depth === row.depth
+    ) {
+      groupEnd += 1;
+    }
+
+    const groupRows = rows.slice(index, groupEnd);
+    index = groupEnd - 1;
+
+    if (guardrailVisibility === "hidden") {
+      continue;
+    }
+
+    if (groupRows.length === 1) {
+      items.push({
+        compact: true,
+        id: row.id,
+        kind: "row",
+        row,
+      });
+      continue;
+    }
+
+    const groupId = getGuardrailGroupId(groupRows);
+    const forceExpanded = groupRows.some(
+      (item) =>
+        item.isActive || item.isDetailTrace || item.hasVisibleChildren,
+    );
+    const isExpanded = forceExpanded || Boolean(expandedGuardrailGroups[groupId]);
+
+    if (!isExpanded) {
+      items.push({
+        id: groupId,
+        isExpanded: false,
+        itemCount: groupRows.length,
+        kind: "guardrail-group",
+        row: buildGuardrailGroupRow(groupRows),
+      });
+      continue;
+    }
+
+    if (expandedGuardrailGroups[groupId]) {
+      items.push({
+        id: groupId,
+        isExpanded: true,
+        itemCount: groupRows.length,
+        kind: "guardrail-group",
+        row: buildGuardrailGroupRow(groupRows),
+      });
+    }
+
+    items.push(
+      ...groupRows.map((item) => ({
+        compact: false,
+        id: item.id,
+        kind: "row" as const,
+        row: item,
+      })),
+    );
+  }
+
+  return items;
+}
+
+function getGuardrailGroupId(rows: HierarchyTimelineRow[]): string {
+  return `guardrail-group:${rows[0]?.id || "unknown"}:${rows.at(-1)?.id || "unknown"}`;
+}
+
+function buildGuardrailGroupRow(
+  rows: HierarchyTimelineRow[],
+): HierarchyTimelineRow {
+  const firstRow = rows[0];
+  const maxEndMs = rows.reduce(
+    (maxValue, row) => Math.max(maxValue, row.offsetMs + row.durationMs),
+    firstRow.offsetMs + firstRow.durationMs,
+  );
+  const guardrailPhase = getSharedTimelineRowValue(rows, "guardrailPhase");
+  const provider = getSharedTimelineRowValue(rows, "provider");
+  const model = getSharedTimelineRowValue(rows, "model");
+
+  return {
+    ...firstRow,
+    badge: "Guardrail",
+    costUsd: sumTimelineRowCosts(rows),
+    durationMs: Math.max(1, maxEndMs - firstRow.offsetMs),
+    guardrailPhase,
+    hasHighlights: rows.some((row) => row.hasHighlights),
+    hasStructuredInput: rows.some((row) => row.hasStructuredInput),
+    hasVisibleChildren: rows.at(-1)?.hasVisibleChildren ?? false,
+    id: getGuardrailGroupId(rows),
+    isActive: false,
+    isDetailTrace: false,
+    isInPath: rows.some((row) => row.isInPath),
+    isLastSibling: rows.at(-1)?.isLastSibling ?? firstRow.isLastSibling,
+    label: getGuardrailGroupLabel(rows, guardrailPhase),
+    meta:
+      formatList([
+        formatList([provider, model]),
+        formatCostSummaryLabel(sumTimelineRowCosts(rows), rows.length > 1),
+      ]) || formatCountLabel(rows.length, "guardrail check"),
+    model,
+    provider,
+    traceId: null,
+    traceKind: "guardrail",
+    type: "guardrail",
+  };
+}
+
+function getGuardrailGroupLabel(
+  rows: HierarchyTimelineRow[],
+  guardrailPhase: string | null,
+): string {
+  if (rows.length === 1) {
+    return rows[0].label;
+  }
+
+  if (guardrailPhase) {
+    return formatCountLabel(rows.length, `${guardrailPhase} guardrail check`);
+  }
+
+  return formatCountLabel(rows.length, "guardrail check");
+}
+
+function getSharedTimelineRowValue<
+  Key extends "guardrailPhase" | "model" | "provider",
+>(
+  rows: HierarchyTimelineRow[],
+  key: Key,
+): HierarchyTimelineRow[Key] | null {
+  const firstValue = rows[0]?.[key] ?? null;
+  return rows.every((row) => (row[key] ?? null) === firstValue)
+    ? firstValue
+    : null;
+}
+
+function sumTimelineRowCosts(rows: HierarchyTimelineRow[]): number | null {
+  const costRows = rows
+    .map((row) => row.costUsd)
+    .filter((cost): cost is number => typeof cost === "number");
+
+  if (!costRows.length) {
+    return null;
+  }
+
+  return roundCostUsd(costRows.reduce((sum, cost) => sum + cost, 0));
 }
 
 function compareHierarchyNodesForTimeline(
@@ -4483,38 +4576,12 @@ function getTimelineTypeLabel(type: string): string {
   }
 }
 
-function formatInsightSource(source: string): string {
-  if (source.startsWith("request:")) {
-    return `Request ${Number(source.split(":")[1] || 0) + 1}`;
-  }
-
-  if (source.startsWith("response:")) {
-    return "Response";
-  }
-
-  if (source.startsWith("stream:")) {
-    return "Stream";
-  }
-
-  if (source === "trace:guardrail") {
-    return "Guardrail context";
-  }
-
-  return source;
-}
-
 function buildHierarchyTimelineRowTooltip(row: HierarchyTimelineRow): string {
   const parts = [
     `${row.label} (${getTimelineTypeLabel(row.type)})`,
     `Started ${formatTimelineTimestamp(row.startedAt)}`,
     `Duration ${formatElapsedLabel(row.durationMs)}`,
   ];
-
-  if (row.hasStructuredInput) {
-    parts.push("Structured input detected");
-  } else if (row.hasHighlights) {
-    parts.push("Trace insights available");
-  }
 
   if (row.costUsd !== null) {
     parts.push(`Cost ${formatUsdCost(row.costUsd)}`);

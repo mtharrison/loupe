@@ -44,11 +44,13 @@ npm install @mtharrison/loupe
 
 ## Quick Start
 
-Enable tracing:
+Enable tracing explicitly:
 
 ```bash
 export LLM_TRACE_ENABLED=1
 ```
+
+Or just run your app with `NODE_ENV=development`. Loupe now enables tracing implicitly in development and opens the dashboard automatically on first start in an interactive local terminal.
 
 If your app already uses a higher-level model interface or the official OpenAI client, Loupe can wrap that directly instead of requiring manual `record*` calls.
 
@@ -94,6 +96,8 @@ When the server starts, Loupe prints the local URL:
 ```text
 [llm-trace] dashboard: http://127.0.0.1:4319
 ```
+
+In `NODE_ENV=development`, Loupe also opens that URL in your browser automatically unless `CI` is set, the terminal is non-interactive, or `LOUPE_OPEN_BROWSER=0`.
 
 If `4319` is already in use and you did not explicitly configure a port, Loupe falls back to another free local port and prints that URL instead.
 
@@ -143,6 +147,25 @@ npm install
 export LLM_TRACE_ENABLED=1
 node examples/nested-tool-call.js
 ```
+
+### Runnable Fully Featured Demo
+
+`examples/fully-featured.js` is a credential-free demo that combines the main local tracing features in one session:
+
+- a top-level input guardrail span recorded with the low-level lifecycle API
+- a wrapped `invoke()` call with a nested stage span and child actor span
+- a handled child-span error so the dashboard shows both success and failure states
+- a wrapped `stream()` call with reconstructed output and usage
+
+Run it with:
+
+```bash
+npm install
+export LLM_TRACE_ENABLED=1
+node examples/fully-featured.js
+```
+
+Supported demo environment variables: `LLM_TRACE_PORT`, `LOUPE_OPEN_BROWSER`.
 
 ## Low-Level Lifecycle API
 
@@ -345,11 +368,12 @@ Environment variables:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `LLM_TRACE_ENABLED` | `false` | Enables Loupe. |
+| `LLM_TRACE_ENABLED` | `true` when `NODE_ENV=development`, otherwise `false` | Enables Loupe. |
 | `LLM_TRACE_HOST` | `127.0.0.1` | Host for the local dashboard server. |
 | `LLM_TRACE_PORT` | `4319` | Port for the local dashboard server. If unset, Loupe tries `4319` first and falls back to a free local port if it is already in use. |
 | `LLM_TRACE_MAX_TRACES` | `1000` | Maximum number of traces kept in memory. |
 | `LLM_TRACE_UI_HOT_RELOAD` | auto in local interactive dev | Enables UI rebuild + reload while developing the dashboard itself. |
+| `LOUPE_OPEN_BROWSER` | `enabled` in local `NODE_ENV=development` sessions | Opens the dashboard in your browser on first server start. Set `0` to suppress it. |
 
 Programmatic configuration is also available through `getLocalLLMTracer(config)`.
 

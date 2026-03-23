@@ -2,6 +2,7 @@
 
 const { afterEach, test } = require('node:test');
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const http = require('node:http');
 
 const {
@@ -21,6 +22,7 @@ const {
   resolveSessionTreeSelection,
   sortSessionNodesForNav,
 } = require('../dist/session-nav.js');
+const { runFullyFeaturedExample } = require('../examples/fully-featured.js');
 const { createTraceServer } = require('../dist/server.js');
 const { TraceStore } = require('../dist/store.js');
 
@@ -99,8 +101,11 @@ function buildSessionTreeFixture() {
 afterEach(() => {
   __resetLocalLLMTracerForTests();
   delete process.env.LLM_TRACE_ENABLED;
+  delete process.env.LOUPE_OPEN_BROWSER;
   delete process.env.LLM_TRACE_PORT;
   delete process.env.LLM_TRACE_UI_HOT_RELOAD;
+  delete process.env.CI;
+  delete process.env.NODE_ENV;
 });
 
 test('OpenTelemetry-style span lifecycle exports record traces through the singleton tracer', async () => {
@@ -184,6 +189,52 @@ test('ring buffer evicts the oldest traces', async () => {
   assert.ok(tracer.store.get(three));
 });
 
+test('NODE_ENV=development enables tracing implicitly', async () => {
+  process.env.NODE_ENV = 'development';
+  const port = reservePort();
+  const tracer = getLocalLLMTracer({ maxTraces: 10, port });
+  tracer.store.clear();
+
+  const spanId = startSpan(
+    { sessionId: 'implicit-dev-enable', actorId: 'actor-a' },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
+    { port },
+  );
+  endSpan(spanId, { message: { role: 'assistant', content: 'ok' }, tool_calls: [], usage: {} }, { port });
+
+  const traces = tracer.store.list().items;
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0].status, 'ok');
+});
+
+test('NODE_ENV=development opens the dashboard automatically on first server start', async () => {
+  process.env.NODE_ENV = 'development';
+  const originalIsTTY = process.stdout.isTTY;
+  const originalSpawn = childProcess.spawn;
+  const calls = [];
+  process.stdout.isTTY = true;
+  childProcess.spawn = (command, args, options) => {
+    calls.push({ args, command, options });
+    return {
+      on() {},
+      unref() {},
+    };
+  };
+
+  try {
+    const port = reservePort();
+    const tracer = getLocalLLMTracer({ maxTraces: 10, port, uiHotReload: false });
+    await tracer.startServer();
+    await tracer.startServer();
+
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].args.at(-1), new RegExp(`^http://127\\.0\\.0\\.1:${port}$`));
+  } finally {
+    process.stdout.isTTY = originalIsTTY;
+    childProcess.spawn = originalSpawn;
+  }
+});
+
 test('nested wrapped model calls create child spans on the same trace', async () => {
   process.env.LLM_TRACE_ENABLED = '1';
   const port = reservePort();
@@ -229,6 +280,67 @@ test('nested wrapped model calls create child spans on the same trace', async ()
   const inner = tracer.store.get(traces.find((item) => item.model === 'gpt-4.1-mini').id);
   assert.equal(inner.parentSpanId, outer.spanContext.spanId);
   assert.equal(inner.spanContext.traceId, outer.spanContext.traceId);
+});
+
+test('fully featured example records guardrails, nested spans, errors, and streaming in one session', async () => {
+  process.env.LLM_TRACE_ENABLED = '1';
+  process.env.LLM_TRACE_PORT = String(reservePort());
+  const port = Number(process.env.LLM_TRACE_PORT);
+
+  const tracer = getLocalLLMTracer({ maxTraces: 20, port });
+  tracer.store.clear();
+
+  const result = await runFullyFeaturedExample({
+    destination: 'Lisbon',
+    keepAlive: false,
+    openBrowser: false,
+    port,
+    sessionId: 'fully-featured-test',
+  });
+
+  assert.equal(result.sessionId, 'fully-featured-test');
+  assert.equal(result.traceCount, 7);
+  assert.match(result.invokeReply, /Day 1: start in Baixa and Chiado/);
+  assert.match(result.streamReply, /Day 1 in Lisbon/);
+
+  const items = tracer.store.list().items;
+  assert.equal(items.length, 7);
+
+  const traces = items.map((item) => tracer.store.get(item.id));
+  assert.ok(traces.every((trace) => trace.hierarchy.sessionId === 'fully-featured-test'));
+  assert.ok(traces.every((trace) => trace.tags.example === 'fully-featured'));
+
+  const rootInvoke = traces.find((trace) => trace.name === 'llm.invoke' && trace.model === 'trip-planner-v2' && trace.kind === 'actor');
+  const rootStream = traces.find((trace) => trace.name === 'llm.stream' && trace.model === 'trip-planner-v2');
+  const childInvoke = traces.find((trace) => trace.name === 'llm.invoke' && trace.model === 'city-researcher-v1');
+  const researchStage = traces.find((trace) => trace.name === 'workflow.research');
+  const inputGuardrail = traces.find((trace) => trace.name === 'guardrail.input');
+  const outputGuardrail = traces.find((trace) => trace.name === 'guardrail.output');
+  const availabilityError = traces.find((trace) => trace.name === 'tool.availability-check');
+
+  assert.ok(rootInvoke);
+  assert.ok(rootStream);
+  assert.ok(childInvoke);
+  assert.ok(researchStage);
+  assert.ok(inputGuardrail);
+  assert.ok(outputGuardrail);
+  assert.ok(availabilityError);
+
+  assert.equal(childInvoke.parentSpanId, rootInvoke.spanContext.spanId);
+  assert.equal(researchStage.parentSpanId, rootInvoke.spanContext.spanId);
+  assert.equal(outputGuardrail.parentSpanId, rootInvoke.spanContext.spanId);
+  assert.equal(researchStage.kind, 'stage');
+  assert.equal(inputGuardrail.kind, 'guardrail');
+  assert.equal(inputGuardrail.hierarchy.guardrailPhase, 'input');
+  assert.equal(outputGuardrail.hierarchy.guardrailPhase, 'output');
+  assert.equal(availabilityError.status, 'error');
+  assert.equal(availabilityError.error.code, 'SUPPLIER_TIMEOUT');
+  assert.equal(rootStream.stream.chunkCount, 3);
+  assert.equal(rootStream.stream.reconstructed.message.content, result.streamReply);
+  assert.equal(rootInvoke.usage.tokens.prompt, 42);
+  assert.equal(rootInvoke.usage.tokens.completion, 68);
+  assert.equal(rootStream.usage.tokens.prompt, 24);
+  assert.equal(rootStream.usage.tokens.completion, 39);
 });
 
 test('hierarchy nests spans by OpenTelemetry parent span id within each session', async () => {
@@ -332,6 +444,30 @@ test('legacy context aliases still normalize into the generic hierarchy model', 
   assert.equal(trace.context.guardrailPhase, 'output');
   assert.equal(trace.hierarchy.sessionId, 'chat-legacy');
   assert.equal(trace.hierarchy.rootActorId, 'root-agent');
+});
+
+test('generic guardrail metadata does not hide delegated agents', async () => {
+  const tracer = getLocalLLMTracer({ maxTraces: 10 });
+  tracer.store.clear();
+
+  const traceId = tracer.startSpan(
+    {
+      sessionId: 'session-subagent',
+      rootSessionId: 'session-subagent',
+      rootActorId: 'assistant',
+      actorId: 'searchKnowledgeBase',
+      guardrailType: 'guardrail',
+      model: 'gpt-4.1',
+    },
+    { mode: 'invoke', request: { input: { messages: [] }, options: {} } },
+  );
+  tracer.endSpan(traceId, { message: { role: 'assistant', content: 'done' }, tool_calls: [], usage: {} });
+
+  const trace = tracer.store.get(traceId);
+  assert.ok(trace);
+  assert.equal(trace.kind, 'child-actor');
+  assert.equal(trace.hierarchy.childActorId, 'searchKnowledgeBase');
+  assert.equal(trace.hierarchy.guardrailType, 'guardrail');
 });
 
 test('gen_ai.conversation.id overrides the session identifier used for hierarchy', async () => {
