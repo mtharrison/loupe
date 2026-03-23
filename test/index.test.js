@@ -191,6 +191,7 @@ test('ring buffer evicts the oldest traces', async () => {
 
 test('NODE_ENV=development enables tracing implicitly', async () => {
   process.env.NODE_ENV = 'development';
+  process.env.LOUPE_OPEN_BROWSER = '0';
   const port = reservePort();
   const tracer = getLocalLLMTracer({ maxTraces: 10, port });
   tracer.store.clear();
