@@ -40,7 +40,7 @@ npm install @mtharrison/loupe
 
 ### Requirements
 
-- Node.js 18 or newer
+- Node.js 20 or newer
 
 ## Quick Start
 
