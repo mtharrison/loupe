@@ -131,7 +131,7 @@ type TraceRecord = {
   parentSpanId: string | null;
   provider: string | null;
   request: {
-    input?: {
+    input?: Record<string, any> & {
       messages?: Array<{ content: any; role: string }>;
       tools?: any[];
     };
@@ -2455,6 +2455,7 @@ function renderTabContent(
   onApplyTraceFilter: (intent: TraceFilterIntent) => void,
 ) {
   const requestMessages = detail.request.input?.messages || [];
+  const requestStructuredOutput = getRequestStructuredOutput(detail.request);
   const responseMessage = getResponseMessage(detail);
   const toolCalls = getToolCalls(detail);
   const usage = getUsage(detail);
@@ -2493,6 +2494,12 @@ function renderTabContent(
             title="Request messages"
             messages={requestMessages}
           />
+          {requestStructuredOutput ? (
+            <JsonCard
+              title={requestStructuredOutput.title}
+              value={requestStructuredOutput.value}
+            />
+          ) : null}
           <JsonCard title="Request options" value={detail.request.options} />
           {(detail.request.input?.tools || []).length ? (
             <JsonCard
@@ -4014,6 +4021,50 @@ function extractTraceRequestPreview(request: TraceRecord["request"]): string {
   }
 
   return summariseMessageValue(lastUserMessage.content);
+}
+
+function getRequestStructuredOutput(request: TraceRecord["request"]): {
+  title: string;
+  value: unknown;
+} | null {
+  const input = request?.input;
+  if (!input || typeof input !== "object") {
+    return null;
+  }
+
+  if ("response_format" in input && input.response_format !== undefined) {
+    return {
+      title: "Response format",
+      value: input.response_format,
+    };
+  }
+
+  if (
+    input.text &&
+    typeof input.text === "object" &&
+    "format" in input.text &&
+    input.text.format !== undefined
+  ) {
+    return {
+      title: "Structured output",
+      value: input.text.format,
+    };
+  }
+
+  const options = request?.options;
+  if (
+    options &&
+    typeof options === "object" &&
+    "responseFormat" in options &&
+    options.responseFormat !== undefined
+  ) {
+    return {
+      title: "Response format",
+      value: options.responseFormat,
+    };
+  }
+
+  return null;
 }
 
 function extractTraceResponsePreview(trace: TraceRecord): string {

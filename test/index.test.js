@@ -921,6 +921,72 @@ test('wrapOpenAIClient records chat.completions invoke traces', async () => {
   assert.equal(trace.response.raw.id, 'chatcmpl-invoke');
 });
 
+test('wrapOpenAIClient preserves response_format on traced requests', async () => {
+  process.env.LLM_TRACE_ENABLED = '1';
+  process.env.LLM_TRACE_PORT = String(reservePort());
+  const port = Number(process.env.LLM_TRACE_PORT);
+
+  const tracer = getLocalLLMTracer({ maxTraces: 10, port });
+  tracer.store.clear();
+
+  const client = wrapOpenAIClient(
+    {
+      chat: {
+        completions: {
+          async create(params) {
+            return {
+              id: 'chatcmpl-response-format',
+              model: params.model,
+              object: 'chat.completion',
+              choices: [
+                {
+                  finish_reason: 'stop',
+                  message: {
+                    role: 'assistant',
+                    content: '{"summary":"ok"}',
+                  },
+                },
+              ],
+              usage: {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+              },
+            };
+          },
+        },
+      },
+    },
+    () => ({ sessionId: 'openai-response-format', rootActorId: 'root', actorId: 'root' }),
+    { port },
+  );
+
+  await client.chat.completions.create({
+    model: 'gpt-4.1',
+    messages: [{ role: 'user', content: 'Return JSON' }],
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'summary_response',
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            summary: { type: 'string' },
+          },
+          required: ['summary'],
+        },
+      },
+    },
+  });
+
+  const [summary] = tracer.store.list().items;
+  const trace = tracer.store.get(summary.id);
+  assert.equal(trace.request.input.response_format.type, 'json_schema');
+  assert.equal(trace.request.input.response_format.json_schema.name, 'summary_response');
+  assert.deepEqual(trace.request.input.response_format.json_schema.schema.required, ['summary']);
+});
+
 test('wrapOpenAIClient records chat.completions stream traces', async () => {
   process.env.LLM_TRACE_ENABLED = '1';
   process.env.LLM_TRACE_PORT = String(reservePort());
