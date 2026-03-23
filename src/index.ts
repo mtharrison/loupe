@@ -400,12 +400,11 @@ function shouldAutoOpenDashboard(): boolean {
     process.env.NODE_ENV === 'development'
     && !process.env.CI
     && !!process.stdout.isTTY
-    && process.env.NODE_ENV !== 'test'
   );
 }
 
 function openBrowser(url: string) {
-  const command =
+  const command: [string, string[]] | null =
     process.platform === 'darwin'
       ? ['open', [url]]
       : process.platform === 'win32'
